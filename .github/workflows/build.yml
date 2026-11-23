@@ -1,0 +1,57 @@
+name: Build Arch Auditor (Rust + eframe)
+
+on:
+    push:
+        branches: ["main", "master"]
+        tags: ["v*"]
+    pull_request:
+        branches: ["main", "master"]
+    workflow_dispatch:
+
+jobs:
+    build-linux:
+        runs-on: ubuntu-24.04
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Install system dependencies for eframe/egui (X11/Wayland/GL)
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                    build-essential \
+                    pkg-config \
+                    libx11-dev \
+                    libxi-dev \
+                    libxcursor-dev \
+                    libxrandr-dev \
+                    libxinerama-dev \
+                    libgl1-mesa-dev \
+                    libxcb1-dev
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache Cargo registry and build artifacts
+              uses: Swatinem/rust-cache@v2
+
+            - name: Run cargo check and clippy
+              run: |
+                  cargo check --all-targets
+                  cargo clippy --all-targets -- -D warnings
+
+            - name: Build release binary
+              run: cargo build --release --locked
+
+            - name: Package release tarball
+              run: |
+                  mkdir -p dist
+                  cp target/release/arch-auditor-egui dist/
+                  cp README.md dist/
+                  tar -czf arch-auditor-egui-linux-x86_64.tar.gz -C dist .
+
+            - name: Upload build artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: arch-auditor-egui-linux-x86_64
+                  path: arch-auditor-egui-linux-x86_64.tar.gz
