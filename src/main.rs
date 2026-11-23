@@ -1,16 +1,40 @@
 use eframe::egui::{self, Color32, Key, Modifiers, RichText};
+use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// ───────────────────────────── Tema ─────────────────────────────
 
 const CVE_CACHE_TTL_SECS: u64 = 600;
+const PORTS_AUTO_REFRESH: Duration = Duration::from_secs(5);
+
+const BG: Color32 = Color32::from_rgb(15, 20, 25);
+const CARD: Color32 = Color32::from_rgb(22, 27, 34);
+const CARD_SEL: Color32 = Color32::from_rgb(28, 38, 50);
+const BORDER: Color32 = Color32::from_rgb(48, 54, 61);
+const MUTED: Color32 = Color32::from_rgb(139, 148, 158);
+const RED: Color32 = Color32::from_rgb(255, 123, 114);
+const ORANGE: Color32 = Color32::from_rgb(210, 153, 34);
+const AMBER: Color32 = Color32::from_rgb(255, 166, 87);
+const GREEN: Color32 = Color32::from_rgb(63, 185, 80);
+const BLUE: Color32 = Color32::from_rgb(121, 192, 255);
+const PURPLE: Color32 = Color32::from_rgb(210, 168, 255);
+const ARCH: Color32 = Color32::from_rgb(23, 147, 209);
+
+// ───────────────────────────── Modelos ─────────────────────────────
+
+fn make_search(parts: &[&str]) -> String {
+    parts.join(" ").to_lowercase()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Exposure {
@@ -28,6 +52,38 @@ struct PortEntry {
     exposure: Exposure,
     process: String,
     pid: String,
+    search: String,
+}
+
+impl PortEntry {
+    fn new(
+        protocol: String,
+        state: String,
+        local_addr: String,
+        port: String,
+        exposure: Exposure,
+        process: String,
+        pid: String,
+    ) -> Self {
+        let search = make_search(&[
+            protocol.as_str(),
+            state.as_str(),
+            local_addr.as_str(),
+            port.as_str(),
+            process.as_str(),
+            pid.as_str(),
+        ]);
+        Self {
+            protocol,
+            state,
+            local_addr,
+            port,
+            exposure,
+            process,
+            pid,
+            search,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +92,25 @@ struct PackageEntry {
     name: String,
     current_ver: String,
     new_ver: String,
+    search: String,
+}
+
+impl PackageEntry {
+    fn new(source: String, name: String, current_ver: String, new_ver: String) -> Self {
+        let search = make_search(&[
+            source.as_str(),
+            name.as_str(),
+            current_ver.as_str(),
+            new_ver.as_str(),
+        ]);
+        Self {
+            source,
+            name,
+            current_ver,
+            new_ver,
+            search,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +120,32 @@ struct DesktopEntryItem {
     binary: String,
     active: bool,
     source_path: String,
+    search: String,
+}
+
+impl DesktopEntryItem {
+    fn new(
+        name: String,
+        session_type: String,
+        binary: String,
+        active: bool,
+        source_path: String,
+    ) -> Self {
+        let search = make_search(&[
+            name.as_str(),
+            session_type.as_str(),
+            binary.as_str(),
+            source_path.as_str(),
+        ]);
+        Self {
+            name,
+            session_type,
+            binary,
+            active,
+            source_path,
+            search,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +154,20 @@ struct AppImageEntry {
     size_human: String,
     executable: bool,
     path: String,
+    search: String,
+}
+
+impl AppImageEntry {
+    fn new(name: String, size_human: String, executable: bool, path: String) -> Self {
+        let search = make_search(&[name.as_str(), path.as_str()]);
+        Self {
+            name,
+            size_human,
+            executable,
+            path,
+            search,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +178,34 @@ struct FlatpakEntry {
     branch: String,
     origin: String,
     installation: String,
+    search: String,
+}
+
+impl FlatpakEntry {
+    fn new(
+        app_id: String,
+        name: String,
+        version: String,
+        branch: String,
+        origin: String,
+        installation: String,
+    ) -> Self {
+        let search = make_search(&[
+            name.as_str(),
+            app_id.as_str(),
+            origin.as_str(),
+            installation.as_str(),
+        ]);
+        Self {
+            app_id,
+            name,
+            version,
+            branch,
+            origin,
+            installation,
+            search,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +216,36 @@ struct CveVulnerabilityEntry {
     fixed_ver: String,
     cves: String,
     detail: String,
+    search: String,
+}
+
+impl CveVulnerabilityEntry {
+    fn new(
+        package: String,
+        severity: String,
+        status: String,
+        fixed_ver: String,
+        cves: String,
+        detail: String,
+    ) -> Self {
+        let search = make_search(&[
+            package.as_str(),
+            severity.as_str(),
+            status.as_str(),
+            fixed_ver.as_str(),
+            cves.as_str(),
+            detail.as_str(),
+        ]);
+        Self {
+            package,
+            severity,
+            status,
+            fixed_ver,
+            cves,
+            detail,
+            search,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,25 +272,46 @@ struct AuditSnapshot {
 }
 
 enum WorkerEvent {
-    FullSnapshot(AuditSnapshot),
-    PackagesCacheUpdated {
+    Ports {
+        ports: Vec<PortEntry>,
+        warning: Option<String>,
+    },
+    Packages {
         packages: Vec<PackageEntry>,
-        package_notes: Vec<String>,
+        notes: Vec<String>,
         updated_unix: u64,
     },
-    CvesUpdated {
+    Cves {
         result: CveResult,
         updated_unix: u64,
     },
-    AppImagesUpdated(Vec<AppImageEntry>),
-    FlatpaksUpdated {
+    Desktops {
+        desktops: Vec<DesktopEntryItem>,
+        summary: String,
+    },
+    AppImages(Vec<AppImageEntry>),
+    Flatpaks {
         flatpaks: Vec<FlatpakEntry>,
         note: Option<String>,
     },
-    ActionResult {
+    ActionDone {
         message: String,
         is_error: bool,
     },
+}
+
+/// Envia eventos da thread de trabalho e acorda a UI imediatamente.
+#[derive(Clone)]
+struct Emitter {
+    tx: Sender<WorkerEvent>,
+    ctx: egui::Context,
+}
+
+impl Emitter {
+    fn send(&self, ev: WorkerEvent) {
+        let _ = self.tx.send(ev);
+        self.ctx.request_repaint();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +324,117 @@ enum ActiveTab {
     Flatpaks,
 }
 
+impl ActiveTab {
+    const ALL: [ActiveTab; 6] = [
+        ActiveTab::Ports,
+        ActiveTab::Packages,
+        ActiveTab::Vulnerabilities,
+        ActiveTab::Desktops,
+        ActiveTab::AppImages,
+        ActiveTab::Flatpaks,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            ActiveTab::Ports => "ports",
+            ActiveTab::Packages => "packages",
+            ActiveTab::Vulnerabilities => "cves",
+            ActiveTab::Desktops => "desktops",
+            ActiveTab::AppImages => "appimages",
+            ActiveTab::Flatpaks => "flatpaks",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.key() == s)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ActiveTab::Ports => "Portas abertas",
+            ActiveTab::Packages => "Pacotes desatualizados",
+            ActiveTab::Vulnerabilities => "Vulnerabilidades (CVEs)",
+            ActiveTab::Desktops => "WMs e ambientes",
+            ActiveTab::AppImages => "AppImages",
+            ActiveTab::Flatpaks => "Flatpaks",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SortState {
+    col: Option<usize>,
+    asc: bool,
+}
+
+struct Status {
+    text: String,
+    is_error: bool,
+    at: Instant,
+}
+
+#[derive(Clone)]
+enum Confirm {
+    AppImage(String),
+    Flatpak {
+        app_id: String,
+        remote: String,
+        user_scope: bool,
+    },
+}
+
+// ───────────────────────────── Utilidades ─────────────────────────────
+
+fn fmt_ago(secs: u64) -> String {
+    if secs < 5 {
+        "agora mesmo".to_string()
+    } else if secs < 60 {
+        format!("há {} s", secs)
+    } else if secs < 3600 {
+        format!("há {} min", secs / 60)
+    } else if secs < 86_400 {
+        format!("há {} h", secs / 3600)
+    } else {
+        format!("há {} d", secs / 86_400)
+    }
+}
+
+fn md_escape(s: &str) -> String {
+    s.replace('|', "\\|")
+}
+
+fn sev_rank(s: &str) -> u8 {
+    match s.to_lowercase().as_str() {
+        "critical" => 0,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    }
+}
+
+fn is_high_severity(s: &str) -> bool {
+    matches!(s.to_lowercase().as_str(), "critical" | "high")
+}
+
+fn sev_color(s: &str) -> Color32 {
+    match s.to_lowercase().as_str() {
+        "critical" | "high" => RED,
+        "medium" => ORANGE,
+        "low" => BLUE,
+        _ => MUTED,
+    }
+}
+
+fn valid_flatpak_token(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+// ───────────────────────────── Coletores ─────────────────────────────
+
 struct ArchCollectors;
 
 impl ArchCollectors {
@@ -138,6 +443,22 @@ impl ArchCollectors {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    fn home() -> PathBuf {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+    }
+
+    fn cache_dir() -> PathBuf {
+        Self::home().join(".cache/arch-auditor")
+    }
+
+    fn is_root() -> bool {
+        fs::metadata("/proc/self")
+            .map(|m| m.uid() == 0)
+            .unwrap_or(false)
     }
 
     fn command_exists(bin: &str) -> bool {
@@ -180,38 +501,61 @@ impl ArchCollectors {
         (endpoint.to_string(), "-".to_string())
     }
 
-    fn run_with_timeout(
-        cmd: &str,
-        args: &[&str],
-        timeout_secs: u64,
-    ) -> Result<std::process::Output, String> {
+    /// Executa um comando com timeout. stdout/stderr são lidos em threads para
+    /// que o processo nunca bloqueie por pipe cheio (> 64 KB).
+    fn run_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<Output, String> {
         let mut child = Command::new(cmd)
             .args(args)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Falha ao iniciar '{}': {}", cmd, e))?;
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+
+        let out_handle = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(s) = stdout_pipe.as_mut() {
+                let _ = s.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let err_handle = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(s) = stderr_pipe.as_mut() {
+                let _ = s.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => {
-                    return child
-                        .wait_with_output()
-                        .map_err(|e| format!("Falha ao coletar saída de '{}': {}", cmd, e));
+                Ok(Some(status)) => {
+                    let stdout = out_handle.join().unwrap_or_default();
+                    let stderr = err_handle.join().unwrap_or_default();
+                    return Ok(Output {
+                        status,
+                        stdout,
+                        stderr,
+                    });
                 }
                 Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
+                    if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(format!("Timeout ({}s) ao executar '{}'", timeout_secs, cmd));
                     }
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(Duration::from_millis(25));
                 }
                 Err(e) => return Err(format!("Erro aguardando '{}': {}", cmd, e)),
             }
         }
     }
+
+    // ── Portas ──
 
     fn collect_open_ports() -> (Vec<PortEntry>, Option<String>) {
         let mut entries = Vec::new();
@@ -256,19 +600,12 @@ impl ArchCollectors {
                             ("oculto (sem root)".to_string(), "-".to_string())
                         };
 
-                        entries.push(PortEntry {
-                            protocol,
-                            state,
-                            local_addr,
-                            port,
-                            exposure,
-                            process,
-                            pid,
-                        });
+                        entries.push(PortEntry::new(
+                            protocol, state, local_addr, port, exposure, process, pid,
+                        ));
                     }
 
-                    let is_root = unsafe { libc_geteuid() } == 0;
-                    if hidden_pids && !is_root {
+                    if hidden_pids && !Self::is_root() {
                         warning = Some(
                             "Alguns processos pertencem a outros usuários/root. Execute com sudo para ver todos os PIDs."
                                 .to_string(),
@@ -337,6 +674,28 @@ impl ArchCollectors {
         pids
     }
 
+    /// /proc/net/tcp imprime o u32 em ordem do host; os bytes em memória já estão
+    /// em ordem de rede, então `to_ne_bytes` devolve o endereço correto.
+    fn decode_ipv4(hex: &str) -> String {
+        u32::from_str_radix(hex, 16)
+            .map(|raw| Ipv4Addr::from(raw.to_ne_bytes()).to_string())
+            .unwrap_or_else(|_| hex.to_string())
+    }
+
+    fn decode_ipv6(hex: &str) -> String {
+        if hex.len() != 32 || !hex.is_ascii() {
+            return format!("[{}]", hex);
+        }
+        let mut bytes = [0u8; 16];
+        for i in 0..4 {
+            let Ok(word) = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16) else {
+                return format!("[{}]", hex);
+            };
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        format!("[{}]", Ipv6Addr::from(bytes))
+    }
+
     fn collect_ports_proc_fallback() -> Vec<PortEntry> {
         let mut out = Vec::new();
         for (proto, path, is_v6) in [
@@ -357,50 +716,50 @@ impl ArchCollectors {
                 let Ok(port_num) = u16::from_str_radix(hex_port, 16) else {
                     continue;
                 };
-                let addr = if !is_v6 {
-                    u32::from_str_radix(hex_ip, 16)
-                        .map(|raw| Ipv4Addr::from(u32::from_le(raw)).to_string())
-                        .unwrap_or_else(|_| hex_ip.to_string())
-                } else if hex_ip.chars().all(|c| c == '0') {
-                    "[::]".to_string()
+                let addr = if is_v6 {
+                    Self::decode_ipv6(hex_ip)
                 } else {
-                    let _ = Ipv6Addr::from([0; 16]);
-                    "[::1]".to_string()
+                    Self::decode_ipv4(hex_ip)
                 };
                 let exposure = Self::classify_bind(&addr);
-                out.push(PortEntry {
-                    protocol: proto.to_string(),
-                    state: "LISTEN".to_string(),
-                    local_addr: addr,
-                    port: port_num.to_string(),
+                out.push(PortEntry::new(
+                    proto.to_string(),
+                    "LISTEN".to_string(),
+                    addr,
+                    port_num.to_string(),
                     exposure,
-                    process: "N/D (/proc/net)".to_string(),
-                    pid: "-".to_string(),
-                });
+                    "N/D (/proc/net)".to_string(),
+                    "-".to_string(),
+                ));
             }
         }
         out
     }
 
-    fn collect_outdated_packages() -> (Vec<PackageEntry>, Vec<String>) {
+    // ── Pacotes ──
+
+    /// Retorna (pacotes, notas, consulta_oficial_ok).
+    fn collect_outdated_packages() -> (Vec<PackageEntry>, Vec<String>, bool) {
         let mut pkgs = Vec::new();
         let mut notes = Vec::new();
+        let mut official_ok = false;
 
         if Self::command_exists("checkupdates") {
             match Self::run_with_timeout("checkupdates", &[], 25) {
                 Ok(output) => {
                     let code = output.status.code().unwrap_or(1);
                     if code == 0 || code == 2 {
+                        official_ok = true;
                         let stdout = String::from_utf8_lossy(&output.stdout);
                         for line in stdout.lines() {
                             let parts: Vec<&str> = line.split_whitespace().collect();
                             if parts.len() >= 4 && parts[2] == "->" {
-                                pkgs.push(PackageEntry {
-                                    source: "Oficial".to_string(),
-                                    name: parts[0].to_string(),
-                                    current_ver: parts[1].to_string(),
-                                    new_ver: parts[3].to_string(),
-                                });
+                                pkgs.push(PackageEntry::new(
+                                    "Oficial".to_string(),
+                                    parts[0].to_string(),
+                                    parts[1].to_string(),
+                                    parts[3].to_string(),
+                                ));
                             }
                         }
                     } else {
@@ -434,12 +793,12 @@ impl ArchCollectors {
                         for line in stdout.lines() {
                             let parts: Vec<&str> = line.split_whitespace().collect();
                             if parts.len() >= 4 && parts[2] == "->" {
-                                pkgs.push(PackageEntry {
-                                    source: format!("AUR ({})", helper),
-                                    name: parts[0].to_string(),
-                                    current_ver: parts[1].to_string(),
-                                    new_ver: parts[3].to_string(),
-                                });
+                                pkgs.push(PackageEntry::new(
+                                    format!("AUR ({})", helper),
+                                    parts[0].to_string(),
+                                    parts[1].to_string(),
+                                    parts[3].to_string(),
+                                ));
                             }
                         }
                     }
@@ -450,14 +809,72 @@ impl ArchCollectors {
             notes.push("Nenhum helper AUR (paru/yay) detectado.".to_string());
         }
 
-        (pkgs, notes)
+        (pkgs, notes, official_ok)
     }
 
+    fn pkg_cache_path() -> PathBuf {
+        Self::cache_dir().join("packages.cache")
+    }
+
+    fn write_pkg_cache(pkgs: &[PackageEntry], ts: u64) {
+        let path = Self::pkg_cache_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut buf = format!("{}\n", ts);
+        for p in pkgs {
+            buf.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                Self::sanitize_field(&p.source),
+                Self::sanitize_field(&p.name),
+                Self::sanitize_field(&p.current_ver),
+                Self::sanitize_field(&p.new_ver),
+            ));
+        }
+        let _ = fs::write(path, buf);
+    }
+
+    fn read_pkg_cache() -> Option<(Vec<PackageEntry>, u64)> {
+        let content = fs::read_to_string(Self::pkg_cache_path()).ok()?;
+        let mut lines = content.lines();
+        let ts: u64 = lines.next()?.trim().parse().ok()?;
+        let mut list = Vec::new();
+        for line in lines {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() >= 4 {
+                list.push(PackageEntry::new(
+                    cols[0].to_string(),
+                    cols[1].to_string(),
+                    cols[2].to_string(),
+                    cols[3].to_string(),
+                ));
+            }
+        }
+        Some((list, ts))
+    }
+
+    /// Coleta pacotes; grava cache em sucesso e cai para o cache em falha.
+    fn collect_packages_cached() -> (Vec<PackageEntry>, Vec<String>, u64) {
+        let (pkgs, mut notes, ok) = Self::collect_outdated_packages();
+        let now = Self::now_unix();
+        if ok {
+            Self::write_pkg_cache(&pkgs, now);
+            return (pkgs, notes, now);
+        }
+        if let Some((cached, ts)) = Self::read_pkg_cache() {
+            notes.push(format!(
+                "Falha ao consultar pacotes oficiais; exibindo cache ({}).",
+                fmt_ago(now.saturating_sub(ts))
+            ));
+            return (cached, notes, ts);
+        }
+        (pkgs, notes, now)
+    }
+
+    // ── CVEs ──
+
     fn cve_cache_path() -> PathBuf {
-        let base = env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        base.join(".cache/arch-auditor/cves.cache")
+        Self::cache_dir().join("cves.cache")
     }
 
     fn sanitize_field(s: &str) -> String {
@@ -483,14 +900,14 @@ impl ArchCollectors {
             }
             let cols: Vec<&str> = line.split('\t').collect();
             if cols.len() >= 5 {
-                entries.push(CveVulnerabilityEntry {
-                    package: cols[0].to_string(),
-                    severity: cols[1].to_string(),
-                    status: cols[2].to_string(),
-                    fixed_ver: cols[3].to_string(),
-                    cves: cols[4].to_string(),
-                    detail: cols.get(5).unwrap_or(&"").to_string(),
-                });
+                entries.push(CveVulnerabilityEntry::new(
+                    cols[0].to_string(),
+                    cols[1].to_string(),
+                    cols[2].to_string(),
+                    cols[3].to_string(),
+                    cols[4].to_string(),
+                    cols.get(5).unwrap_or(&"").to_string(),
+                ));
             }
         }
 
@@ -503,8 +920,8 @@ impl ArchCollectors {
             )
         } else {
             format!(
-                "Exibindo cache expirado ({}s atrás) por falha ou ausência de rede/arch-audit.",
-                age
+                "Exibindo cache expirado ({}) por falha ou ausência de rede/arch-audit.",
+                fmt_ago(age)
             )
         };
 
@@ -545,22 +962,39 @@ impl ArchCollectors {
             .collect()
     }
 
+    /// Formato padrão do arch-audit:
+    ///   "Package nginx is affected by CVE-2021-1, CVE-2021-2. High risk! Update to 1.2.3-1!"
     fn parse_arch_audit_line(line: &str) -> Option<CveVulnerabilityEntry> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return None;
         }
 
-        let pkg = Self::clean_pkg_name(trimmed);
+        let raw: Vec<&str> = trimmed.split_whitespace().collect();
+        let first = *raw.first()?;
+        let name_tok = if first.eq_ignore_ascii_case("package") {
+            *raw.get(1)?
+        } else {
+            first
+        };
+        let pkg = Self::clean_pkg_name(name_tok);
         if pkg.is_empty() {
             return None;
         }
 
-        let cves: Vec<String> = trimmed
-            .split_whitespace()
+        let norm: Vec<String> = raw
+            .iter()
+            .map(|t| {
+                t.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                    .to_lowercase()
+            })
+            .collect();
+
+        let cves: Vec<String> = raw
+            .iter()
             .filter_map(|t| {
                 let clean = t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-                if clean.starts_with("CVE-") && clean.len() > 8 {
+                if clean.to_uppercase().starts_with("CVE-") && clean.len() > 8 {
                     Some(clean.to_uppercase())
                 } else {
                     None
@@ -568,48 +1002,49 @@ impl ArchCollectors {
             })
             .collect();
 
-        let lower = trimmed.to_lowercase();
-        let severity = if lower.contains("high severity")
-            || lower.contains("high risk")
-            || lower.contains("critical")
-            || lower.contains("(high)")
-        {
-            "High"
-        } else if lower.contains("medium severity")
-            || lower.contains("medium risk")
-            || lower.contains("(medium)")
-        {
-            "Medium"
-        } else if lower.contains("low severity")
-            || lower.contains("low risk")
-            || lower.contains("(low)")
-        {
-            "Low"
-        } else if !cves.is_empty() {
-            "Medium"
-        } else {
-            "Unknown"
+        // Severidade: "<nível> risk" / "<nível> severity" (palavras inteiras, sem falsos positivos).
+        let mut severity = "Unknown";
+        for w in norm.windows(2) {
+            if matches!(w[1].as_str(), "risk" | "severity") {
+                severity = match w[0].as_str() {
+                    "critical" => "Critical",
+                    "high" => "High",
+                    "medium" => "Medium",
+                    "low" => "Low",
+                    _ => continue,
+                };
+                break;
+            }
         }
-        .to_string();
+        if severity == "Unknown" {
+            let lower = trimmed.to_lowercase();
+            severity = if lower.contains("(critical)") {
+                "Critical"
+            } else if lower.contains("(high)") {
+                "High"
+            } else if lower.contains("(medium)") {
+                "Medium"
+            } else if lower.contains("(low)") {
+                "Low"
+            } else {
+                "Unknown"
+            };
+        }
 
-        let (status, fixed_ver) = if lower.contains("not fixed")
-            || lower.contains("unfixed")
-            || lower.contains("vulnerable")
-        {
-            ("Vulnerável".to_string(), "Sem correção".to_string())
-        } else if lower.contains("fixed") {
-            let ver = trimmed
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .find(|w| w[0].eq_ignore_ascii_case("fixed"))
-                .map(|w| w[1].trim_matches(|c: char| matches!(c, ',' | ';' | ')' | '.')))
-                .filter(|s| !s.is_empty())
-                .unwrap_or("Atualizar pacote")
-                .to_string();
-            ("Correção disponível".to_string(), ver)
-        } else {
-            ("Reportado".to_string(), "Ver advisory".to_string())
+        // Versão corrigida: "Update to <versão>"
+        let fixed = norm
+            .windows(2)
+            .position(|w| w[0] == "update" && w[1] == "to")
+            .and_then(|i| raw.get(i + 2))
+            .map(|v| {
+                v.trim_matches(|c: char| matches!(c, '!' | '.' | ',' | ';' | '(' | ')'))
+                    .to_string()
+            })
+            .filter(|v| !v.is_empty());
+
+        let (status, fixed_ver) = match fixed {
+            Some(v) => ("Correção disponível".to_string(), v),
+            None => ("Vulnerável".to_string(), "Sem correção".to_string()),
         };
 
         let cve_str = if !cves.is_empty() {
@@ -618,14 +1053,14 @@ impl ArchCollectors {
             format!("Advisory de {}", pkg)
         };
 
-        Some(CveVulnerabilityEntry {
-            package: pkg,
-            severity,
+        Some(CveVulnerabilityEntry::new(
+            pkg,
+            severity.to_string(),
             status,
             fixed_ver,
-            cves: cve_str,
-            detail: trimmed.to_string(),
-        })
+            cve_str,
+            trimmed.to_string(),
+        ))
     }
 
     fn advisory_url_from_query(query: &str, fallback_pkg: &str) -> String {
@@ -645,6 +1080,10 @@ impl ArchCollectors {
         }
 
         "https://security.archlinux.org/advisory".to_string()
+    }
+
+    fn advisory_url(entry: &CveVulnerabilityEntry) -> String {
+        Self::advisory_url_from_query(&entry.cves, &entry.package)
     }
 
     fn collect_cve_vulnerabilities(force_refresh: bool) -> CveResult {
@@ -677,53 +1116,33 @@ impl ArchCollectors {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
-                let mut entries = Vec::new();
-                for line in stdout.lines() {
-                    if let Some(item) = Self::parse_arch_audit_line(line) {
-                        entries.push(item);
-                    }
-                }
+                let mut entries: Vec<CveVulnerabilityEntry> = stdout
+                    .lines()
+                    .filter_map(Self::parse_arch_audit_line)
+                    .collect();
 
-                if entries.is_empty() && !output.status.success() {
+                if entries.is_empty() && !output.status.success() && !stderr.is_empty() {
                     if let Some(mut stale) = Self::read_cve_cache(true) {
                         stale.note = Some(format!(
                             "Falha ao consultar arch-audit ({}) — exibindo cache local.",
-                            if stderr.is_empty() {
-                                "verifique rede/security.archlinux.org"
-                            } else {
-                                &stderr
-                            }
+                            stderr
                         ));
                         return stale;
                     }
                     return CveResult {
                         entries: Vec::new(),
-                        note: Some(format!(
-                            "Falha ao executar arch-audit ({})",
-                            if stderr.is_empty() {
-                                "sem saída ou sem conexão com security.archlinux.org"
-                            } else {
-                                &stderr
-                            }
-                        )),
+                        note: Some(format!("Falha ao executar arch-audit ({})", stderr)),
                         from_cache: false,
                     };
                 }
 
                 entries.sort_by(|a, b| {
-                    let rank = |s: &str| match s.to_lowercase().as_str() {
-                        "high" | "critical" => 0,
-                        "medium" => 1,
-                        "low" => 2,
-                        _ => 3,
-                    };
-                    rank(&a.severity)
-                        .cmp(&rank(&b.severity))
+                    sev_rank(&a.severity)
+                        .cmp(&sev_rank(&b.severity))
                         .then(a.package.to_lowercase().cmp(&b.package.to_lowercase()))
                 });
 
-                let now = Self::now_unix();
-                Self::write_cve_cache(&entries, now);
+                Self::write_cve_cache(&entries, Self::now_unix());
 
                 let note = if entries.is_empty() {
                     Some(
@@ -758,25 +1177,6 @@ impl ArchCollectors {
         }
     }
 
-    // fn advisory_url_from_query(query: &str, fallback_pkg: &str) -> String {
-    //     for token in query.split(|c: char| !c.is_ascii_alphanumeric() && c != '-') {
-    //         let upper = token.trim().to_uppercase();
-    //         if upper.starts_with("CVE-") && upper.len() > 8 {
-    //             return format!("https://security.archlinux.org/{}", upper);
-    //         }
-    //     }
-    //     let pkg = query.trim();
-    //     if !pkg.is_empty() {
-    //         format!("https://security.archlinux.org/packages/{}/", pkg)
-    //     } else {
-    //         format!("https://security.archlinux.org/packages/{}/", fallback_pkg)
-    //     }
-    // }
-
-    fn advisory_url(entry: &CveVulnerabilityEntry) -> String {
-        Self::advisory_url_from_query(&entry.cves, &entry.package)
-    }
-
     fn open_in_browser(url: &str) -> Result<(), String> {
         if !Self::command_exists("xdg-open") {
             return Err("Comando 'xdg-open' não encontrado (instale 'xdg-utils').".to_string());
@@ -791,20 +1191,47 @@ impl ArchCollectors {
             .map_err(|e| format!("Falha ao abrir '{}' com xdg-open: {}", url, e))
     }
 
+    // ── WMs / DEs ──
+
     fn collect_wms_and_des() -> (Vec<DesktopEntryItem>, String) {
-        let current_desktop = env::var("XDG_CURRENT_DESKTOP")
+        let xdg_current = env::var("XDG_CURRENT_DESKTOP")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                env::var("DESKTOP_SESSION")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            })
+            .filter(|s| !s.trim().is_empty());
+        let desktop_session = env::var("DESKTOP_SESSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        let current_desktop = xdg_current
+            .clone()
+            .or(desktop_session.clone())
             .unwrap_or_else(|| "Desconhecida / TTY".to_string());
 
         let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "N/D".to_string());
-        let summary = format!("Sessão Atual: {} ({})", current_desktop, session_type);
-        let active_lower = current_desktop.to_lowercase();
+        let summary = format!("Sessão atual: {} ({})", current_desktop, session_type);
+
+        // Tokens do desktop ativo (XDG_CURRENT_DESKTOP pode ser "KDE", "GNOME:GNOME-Classic", etc.)
+        let mut active_tokens: Vec<String> = Vec::new();
+        for src in [xdg_current, desktop_session].into_iter().flatten() {
+            for tok in src.split(':') {
+                let mut t = tok.trim().to_lowercase();
+                if t.is_empty() {
+                    continue;
+                }
+                if t == "kde" {
+                    t = "plasma".to_string();
+                }
+                if !active_tokens.contains(&t) {
+                    active_tokens.push(t);
+                }
+            }
+        }
+        let is_active = |haystacks: &[&str]| -> bool {
+            active_tokens.iter().any(|tok| {
+                haystacks
+                    .iter()
+                    .any(|h| h.to_lowercase().contains(tok.as_str()))
+            })
+        };
 
         let mut map: HashMap<String, DesktopEntryItem> = HashMap::new();
 
@@ -814,8 +1241,7 @@ impl ArchCollectors {
         ];
 
         for (dir_str, s_type) in session_dirs {
-            let dir = Path::new(dir_str);
-            let Ok(entries) = fs::read_dir(dir) else {
+            let Ok(entries) = fs::read_dir(Path::new(dir_str)) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -847,24 +1273,26 @@ impl ArchCollectors {
                     }
                 }
 
-                let active = name.to_lowercase().contains(&active_lower)
-                    || stem.to_lowercase().contains(&active_lower);
+                let active = is_active(&[name.as_str(), stem.as_str(), exec_bin.as_str()])
+                    && (session_type.eq_ignore_ascii_case(s_type)
+                        || session_type == "N/D"
+                        || session_type == "tty");
 
                 let key = format!("{}-{}", name.to_lowercase(), s_type);
                 map.insert(
                     key,
-                    DesktopEntryItem {
+                    DesktopEntryItem::new(
                         name,
-                        session_type: s_type.to_string(),
-                        binary: exec_bin,
+                        s_type.to_string(),
+                        exec_bin,
                         active,
-                        source_path: path.display().to_string(),
-                    },
+                        path.display().to_string(),
+                    ),
                 );
             }
         }
 
-        let known_bins: [(&str, &str, &str); 20] = [
+        const KNOWN_BINS: &[(&str, &str, &str)] = &[
             ("hyprland", "Hyprland", "Wayland"),
             ("sway", "Sway", "Wayland"),
             ("river", "River", "Wayland"),
@@ -887,7 +1315,7 @@ impl ArchCollectors {
             ("lxqt-session", "LXQt", "X11"),
         ];
 
-        for (bin, friendly, s_type) in known_bins {
+        for (bin, friendly, s_type) in KNOWN_BINS {
             if !Self::command_exists(bin) {
                 continue;
             }
@@ -896,17 +1324,16 @@ impl ArchCollectors {
                     || item.binary.contains(bin)
             });
             if !already {
-                let active =
-                    friendly.to_lowercase().contains(&active_lower) || bin.contains(&active_lower);
+                let active = is_active(&[friendly, bin]);
                 map.insert(
                     format!("bin-{}", bin),
-                    DesktopEntryItem {
-                        name: friendly.to_string(),
-                        session_type: s_type.to_string(),
-                        binary: format!("/usr/bin/{}", bin),
+                    DesktopEntryItem::new(
+                        friendly.to_string(),
+                        s_type.to_string(),
+                        format!("/usr/bin/{}", bin),
                         active,
-                        source_path: "Binário (/usr/bin)".to_string(),
-                    },
+                        "Binário (/usr/bin)".to_string(),
+                    ),
                 );
             }
         }
@@ -920,6 +1347,8 @@ impl ArchCollectors {
         (list, summary)
     }
 
+    // ── AppImages ──
+
     fn human_size(bytes: u64) -> String {
         let mut val = bytes as f64;
         for unit in ["B", "KiB", "MiB", "GiB"] {
@@ -932,14 +1361,14 @@ impl ArchCollectors {
     }
 
     fn collect_appimages() -> Vec<AppImageEntry> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-            roots.push(home.join("Applications"));
-            roots.push(home.join("Downloads"));
-            roots.push(home.join("Desktop"));
-            roots.push(home.join(".local/bin"));
-        }
-        roots.push(PathBuf::from("/opt"));
+        let home = Self::home();
+        let roots: Vec<PathBuf> = vec![
+            home.join("Applications"),
+            home.join("Downloads"),
+            home.join("Desktop"),
+            home.join(".local/bin"),
+            PathBuf::from("/opt"),
+        ];
 
         let mut results = Vec::new();
         let mut seen_canonical: HashSet<PathBuf> = HashSet::new();
@@ -997,12 +1426,12 @@ impl ArchCollectors {
                     .to_string();
                 if fname.to_lowercase().ends_with(".appimage") {
                     let exec = meta.permissions().mode() & 0o111 != 0;
-                    out.push(AppImageEntry {
-                        name: fname,
-                        size_human: Self::human_size(meta.len()),
-                        executable: exec,
-                        path: path.display().to_string(),
-                    });
+                    out.push(AppImageEntry::new(
+                        fname,
+                        Self::human_size(meta.len()),
+                        exec,
+                        path.display().to_string(),
+                    ));
                 }
             }
         }
@@ -1038,10 +1467,7 @@ impl ArchCollectors {
             return Err("O arquivo selecionado deve terminar com .AppImage.".to_string());
         }
 
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| "Variável HOME não definida.".to_string())?;
-        let dest_dir = home.join("Applications");
+        let dest_dir = Self::home().join("Applications");
         fs::create_dir_all(&dest_dir)
             .map_err(|e| format!("Falha ao criar '{}': {}", dest_dir.display(), e))?;
 
@@ -1061,6 +1487,8 @@ impl ArchCollectors {
             dest_path.display()
         ))
     }
+
+    // ── Flatpak ──
 
     fn collect_flatpaks() -> (Vec<FlatpakEntry>, Option<String>) {
         if !Self::command_exists("flatpak") {
@@ -1092,34 +1520,21 @@ impl ArchCollectors {
                 for line in stdout.lines() {
                     let cols: Vec<&str> = line.split('\t').collect();
                     if cols.len() >= 2 {
-                        list.push(FlatpakEntry {
-                            app_id: cols[0].trim().to_string(),
-                            name: cols[1].trim().to_string(),
-                            version: cols
-                                .get(2)
+                        let col = |i: usize| -> String {
+                            cols.get(i)
                                 .map(|s| s.trim())
                                 .filter(|s| !s.is_empty())
                                 .unwrap_or("-")
-                                .to_string(),
-                            branch: cols
-                                .get(3)
-                                .map(|s| s.trim())
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("-")
-                                .to_string(),
-                            origin: cols
-                                .get(4)
-                                .map(|s| s.trim())
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("-")
-                                .to_string(),
-                            installation: cols
-                                .get(5)
-                                .map(|s| s.trim())
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("-")
-                                .to_string(),
-                        });
+                                .to_string()
+                        };
+                        list.push(FlatpakEntry::new(
+                            cols[0].trim().to_string(),
+                            cols[1].trim().to_string(),
+                            col(2),
+                            col(3),
+                            col(4),
+                            col(5),
+                        ));
                     }
                 }
                 if list.is_empty() {
@@ -1150,6 +1565,12 @@ impl ArchCollectors {
         if app_id.is_empty() {
             return Err("Informe um Application ID válido (ex.: org.mozilla.firefox).".to_string());
         }
+        if !valid_flatpak_token(app_id) || !valid_flatpak_token(remote) {
+            return Err(
+                "Application ID e remote só podem conter letras, números, '.', '_' e '-' (e não podem começar com '-')."
+                    .to_string(),
+            );
+        }
         if !Self::command_exists("flatpak") {
             return Err(
                 "Comando 'flatpak' não encontrado. Instale com: sudo pacman -S flatpak".to_string(),
@@ -1178,29 +1599,7 @@ impl ArchCollectors {
         }
     }
 
-    fn collect_all(force_cve_refresh: bool) -> AuditSnapshot {
-        let (ports, ports_warning) = Self::collect_open_ports();
-        let (desktops, session_summary) = Self::collect_wms_and_des();
-        let appimages = Self::collect_appimages();
-        let (flatpaks, flatpak_note) = Self::collect_flatpaks();
-        let (packages, package_notes) = Self::collect_outdated_packages();
-        let cve_res = Self::collect_cve_vulnerabilities(force_cve_refresh);
-
-        AuditSnapshot {
-            ports,
-            ports_warning,
-            packages,
-            package_notes,
-            desktops,
-            session_summary,
-            appimages,
-            flatpaks,
-            flatpak_note,
-            vulnerabilities: cve_res.entries,
-            vulnerability_note: cve_res.note,
-            last_updated_unix: Self::now_unix(),
-        }
-    }
+    // ── Exportação ──
 
     fn build_summary_markdown(snap: &AuditSnapshot, ts: u64) -> String {
         let mut md = String::new();
@@ -1245,7 +1644,12 @@ impl ArchCollectors {
             for p in external_ports {
                 md.push_str(&format!(
                     "| {} | `{}` | `{}` | {} | {} | {} |\n",
-                    p.protocol, p.local_addr, p.port, p.process, p.pid, p.state
+                    p.protocol,
+                    p.local_addr,
+                    p.port,
+                    md_escape(&p.process),
+                    p.pid,
+                    p.state
                 ));
             }
             md.push('\n');
@@ -1271,7 +1675,7 @@ impl ArchCollectors {
             md.push_str(
                 snap.vulnerability_note
                     .as_deref()
-                    .unwrap_or("Nenhuma vulnerabilidade CVE listada.\n"),
+                    .unwrap_or("Nenhuma vulnerabilidade CVE listada."),
             );
             md.push_str("\n\n");
         } else {
@@ -1281,7 +1685,12 @@ impl ArchCollectors {
                 let url = Self::advisory_url(v);
                 md.push_str(&format!(
                     "| `{}` | {} | {} | `{}` | {} | [Link]({}) |\n",
-                    v.package, v.severity, v.status, v.fixed_ver, v.cves, url
+                    v.package,
+                    v.severity,
+                    v.status,
+                    v.fixed_ver,
+                    md_escape(&v.cves),
+                    url
                 ));
             }
             md.push('\n');
@@ -1328,10 +1737,7 @@ impl ArchCollectors {
 
     fn export_summary(snap: &AuditSnapshot) -> Result<PathBuf, String> {
         let ts = Self::now_unix();
-        let base_dir = env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let out_path = base_dir.join(format!("arch-audit-resumo-{}.md", ts));
+        let out_path = Self::home().join(format!("arch-audit-resumo-{}.md", ts));
         let content = Self::build_summary_markdown(snap, ts);
         fs::write(&out_path, content)
             .map_err(|e| format!("Falha ao salvar resumo em '{}': {}", out_path.display(), e))?;
@@ -1339,12 +1745,60 @@ impl ArchCollectors {
     }
 }
 
-unsafe fn libc_geteuid() -> u32 {
-    unsafe extern "C" {
-        fn geteuid() -> u32;
-    }
-    unsafe { geteuid() }
+// ───────────────────────────── Helpers de UI ─────────────────────────────
+
+fn card_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(CARD)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(10))
 }
+
+fn empty_state(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new(text).color(MUTED));
+    });
+}
+
+fn count_label(ui: &mut egui::Ui, shown: usize, total: usize) {
+    ui.label(
+        RichText::new(format!("Mostrando {} de {}", shown, total))
+            .color(MUTED)
+            .small(),
+    );
+}
+
+fn sort_header(ui: &mut egui::Ui, title: &str, idx: usize, sort: &mut SortState) {
+    let arrow = match sort.col {
+        Some(c) if c == idx => {
+            if sort.asc {
+                " ▲"
+            } else {
+                " ▼"
+            }
+        }
+        _ => "",
+    };
+    let resp = ui
+        .add(
+            egui::Label::new(RichText::new(format!("{}{}", title, arrow)).strong())
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Clique para ordenar");
+    if resp.clicked() {
+        if sort.col == Some(idx) {
+            sort.asc = !sort.asc;
+        } else {
+            sort.col = Some(idx);
+            sort.asc = true;
+        }
+    }
+}
+
+// ───────────────────────────── App ─────────────────────────────
 
 struct ArchAuditorApp {
     data: AuditSnapshot,
@@ -1352,31 +1806,42 @@ struct ArchAuditorApp {
     filter: String,
     only_external_ports: bool,
     only_high_cve: bool,
+    auto_refresh_ports: bool,
     cve_lookup_input: String,
     appimage_source_input: String,
     flatpak_id_input: String,
     flatpak_remote_input: String,
     flatpak_user_scope: bool,
-    loading_full: bool,
-    loading_pkg_cache: bool,
+
+    loading_ports: bool,
+    loading_pkgs: bool,
     loading_cves: bool,
+    loading_desktops: bool,
+    loading_appimages: bool,
+    loading_flatpaks: bool,
     loading_action: bool,
-    status_message: Option<(String, bool)>,
-    rx: Option<Receiver<WorkerEvent>>,
+    full_running: bool,
+
+    status: Option<Status>,
+    confirm: Option<Confirm>,
+    ports_sort: SortState,
+    pkgs_sort: SortState,
+    cves_sort: SortState,
+    last_ports_refresh: Instant,
+
+    rx: Receiver<WorkerEvent>,
+    emitter: Emitter,
 }
 
 impl ArchAuditorApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(15, 20, 25);
-        visuals.window_fill = Color32::from_rgb(15, 20, 25);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(22, 27, 34);
-        cc.egui_ctx.set_visuals(visuals);
+        Self::apply_theme(&cc.egui_ctx);
 
-        let mut style = (*cc.egui_ctx.global_style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
-        cc.egui_ctx.set_global_style(style);
+        let (tx, rx) = mpsc::channel();
+        let emitter = Emitter {
+            tx,
+            ctx: cc.egui_ctx.clone(),
+        };
 
         let mut app = Self {
             data: AuditSnapshot::default(),
@@ -1384,59 +1849,175 @@ impl ArchAuditorApp {
             filter: String::new(),
             only_external_ports: false,
             only_high_cve: false,
+            auto_refresh_ports: false,
             cve_lookup_input: String::new(),
             appimage_source_input: String::new(),
             flatpak_id_input: String::new(),
             flatpak_remote_input: "flathub".to_string(),
             flatpak_user_scope: true,
-            loading_full: false,
-            loading_pkg_cache: false,
+            loading_ports: false,
+            loading_pkgs: false,
             loading_cves: false,
+            loading_desktops: false,
+            loading_appimages: false,
+            loading_flatpaks: false,
             loading_action: false,
-            status_message: None,
-            rx: None,
+            full_running: false,
+            status: None,
+            confirm: None,
+            ports_sort: SortState::default(),
+            pkgs_sort: SortState::default(),
+            cves_sort: SortState::default(),
+            last_ports_refresh: Instant::now(),
+            rx,
+            emitter,
         };
+
+        app.load_settings(cc.storage);
+
+        // Mostra imediatamente o último cache de pacotes enquanto o refresh roda.
+        if let Some((pkgs, ts)) = ArchCollectors::read_pkg_cache() {
+            let age = ArchCollectors::now_unix().saturating_sub(ts);
+            app.data.packages = pkgs;
+            app.data.package_notes = vec![format!(
+                "Exibindo cache ({}) — atualizando em segundo plano...",
+                fmt_ago(age)
+            )];
+            app.data.last_updated_unix = ts;
+        }
+
         app.start_full_refresh(false);
         app
     }
 
-    fn ensure_channel(&mut self) -> mpsc::Sender<WorkerEvent> {
-        let (tx, rx) = mpsc::channel();
-        self.rx = Some(rx);
-        tx
+    fn apply_theme(ctx: &egui::Context) {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = BG;
+        visuals.window_fill = BG;
+        visuals.extreme_bg_color = Color32::from_rgb(13, 17, 23);
+        visuals.faint_bg_color = Color32::from_rgb(20, 26, 33);
+        visuals.widgets.noninteractive.bg_fill = CARD;
+        ctx.set_visuals(visuals);
+
+        let mut style = (*ctx.global_style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        ctx.set_global_style(style);
     }
 
-    fn start_full_refresh(&mut self, force_cve: bool) {
-        let tx = self.ensure_channel();
-        self.loading_full = true;
-        self.status_message = Some((
-            "Executando auditoria completa do sistema...".to_string(),
-            false,
-        ));
+    // ── Persistência (requer a feature "persistence" do eframe; sem ela é ignorada) ──
 
-        thread::spawn(move || {
-            let snap = ArchCollectors::collect_all(force_cve);
-            let _ = tx.send(WorkerEvent::FullSnapshot(snap));
+    fn load_settings(&mut self, storage: Option<&dyn eframe::Storage>) {
+        let Some(st) = storage else {
+            return;
+        };
+        if let Some(t) = st
+            .get_string("tab")
+            .and_then(|s| ActiveTab::from_key(s.as_str()))
+        {
+            self.active_tab = t;
+        }
+        let flag = |key: &str| st.get_string(key).map(|s| s == "1");
+        self.only_external_ports = flag("only_external").unwrap_or(false);
+        self.only_high_cve = flag("only_high").unwrap_or(false);
+        self.auto_refresh_ports = flag("auto_ports").unwrap_or(false);
+        self.flatpak_user_scope = flag("flatpak_user").unwrap_or(true);
+        if let Some(r) = st.get_string("flatpak_remote") {
+            if !r.trim().is_empty() {
+                self.flatpak_remote_input = r;
+            }
+        }
+    }
+
+    // ── Estado / status ──
+
+    fn any_data_loading(&self) -> bool {
+        self.loading_ports
+            || self.loading_pkgs
+            || self.loading_cves
+            || self.loading_desktops
+            || self.loading_appimages
+            || self.loading_flatpaks
+    }
+
+    fn any_busy(&self) -> bool {
+        self.any_data_loading() || self.loading_action
+    }
+
+    fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
+        self.status = Some(Status {
+            text: text.into(),
+            is_error,
+            at: Instant::now(),
         });
     }
 
-    fn start_pkg_cache_refresh(&mut self) {
-        if self.loading_pkg_cache {
+    /// Mensagem de início só aparece em refresh individual (a auditoria completa tem a sua).
+    fn note_start(&mut self, text: &str) {
+        if !self.full_running {
+            self.set_status(text, false);
+        }
+    }
+
+    fn bump_updated(&mut self, ts: u64) {
+        self.data.last_updated_unix = self.data.last_updated_unix.max(ts);
+    }
+
+    fn expire_status(&mut self, ctx: &egui::Context) {
+        if self.any_busy() {
             return;
         }
-        let tx = self.ensure_channel();
-        self.loading_pkg_cache = true;
-        self.status_message = Some((
-            "Atualizando cache de pacotes desatualizados (checkupdates / AUR)...".to_string(),
-            false,
-        ));
+        let Some((is_error, age)) = self.status.as_ref().map(|s| (s.is_error, s.at.elapsed()))
+        else {
+            return;
+        };
+        let ttl = Duration::from_secs(if is_error { 15 } else { 8 });
+        if age >= ttl {
+            self.status = None;
+        } else {
+            ctx.request_repaint_after(ttl - age);
+        }
+    }
 
+    // ── Disparo de tarefas (todas usam o mesmo canal) ──
+
+    fn start_full_refresh(&mut self, force_cve: bool) {
+        self.full_running = true;
+        self.set_status("Executando auditoria completa do sistema...", false);
+        self.start_ports_refresh();
+        self.start_desktops_refresh();
+        self.start_appimages_refresh();
+        self.start_flatpaks_refresh();
+        self.start_pkgs_refresh();
+        self.start_cve_refresh(force_cve);
+    }
+
+    fn start_ports_refresh(&mut self) {
+        if self.loading_ports {
+            return;
+        }
+        self.loading_ports = true;
+        self.last_ports_refresh = Instant::now();
+        let em = self.emitter.clone();
         thread::spawn(move || {
-            let (packages, package_notes) = ArchCollectors::collect_outdated_packages();
-            let _ = tx.send(WorkerEvent::PackagesCacheUpdated {
+            let (ports, warning) = ArchCollectors::collect_open_ports();
+            em.send(WorkerEvent::Ports { ports, warning });
+        });
+    }
+
+    fn start_pkgs_refresh(&mut self) {
+        if self.loading_pkgs {
+            return;
+        }
+        self.loading_pkgs = true;
+        self.note_start("Atualizando pacotes desatualizados (checkupdates / AUR)...");
+        let em = self.emitter.clone();
+        thread::spawn(move || {
+            let (packages, notes, updated_unix) = ArchCollectors::collect_packages_cached();
+            em.send(WorkerEvent::Packages {
                 packages,
-                package_notes,
-                updated_unix: ArchCollectors::now_unix(),
+                notes,
+                updated_unix,
             });
         });
     }
@@ -1445,103 +2026,120 @@ impl ArchAuditorApp {
         if self.loading_cves {
             return;
         }
-        let tx = self.ensure_channel();
         self.loading_cves = true;
-        self.status_message = Some((
-            "Atualizando vulnerabilidades CVE via arch-audit...".to_string(),
-            false,
-        ));
-
+        self.note_start("Atualizando vulnerabilidades CVE via arch-audit...");
+        let em = self.emitter.clone();
         thread::spawn(move || {
             let result = ArchCollectors::collect_cve_vulnerabilities(force_refresh);
-            let _ = tx.send(WorkerEvent::CvesUpdated {
+            em.send(WorkerEvent::Cves {
                 result,
                 updated_unix: ArchCollectors::now_unix(),
             });
         });
     }
 
-    fn start_install_appimage(&mut self, source_path: String) {
-        let tx = self.ensure_channel();
-        self.loading_action = true;
-        self.status_message = Some((
-            "Instalando AppImage em ~/Applications...".to_string(),
-            false,
-        ));
+    fn start_desktops_refresh(&mut self) {
+        if self.loading_desktops {
+            return;
+        }
+        self.loading_desktops = true;
+        let em = self.emitter.clone();
+        thread::spawn(move || {
+            let (desktops, summary) = ArchCollectors::collect_wms_and_des();
+            em.send(WorkerEvent::Desktops { desktops, summary });
+        });
+    }
 
+    fn start_appimages_refresh(&mut self) {
+        if self.loading_appimages {
+            return;
+        }
+        self.loading_appimages = true;
+        let em = self.emitter.clone();
+        thread::spawn(move || {
+            em.send(WorkerEvent::AppImages(ArchCollectors::collect_appimages()));
+        });
+    }
+
+    fn start_flatpaks_refresh(&mut self) {
+        if self.loading_flatpaks {
+            return;
+        }
+        self.loading_flatpaks = true;
+        let em = self.emitter.clone();
+        thread::spawn(move || {
+            let (flatpaks, note) = ArchCollectors::collect_flatpaks();
+            em.send(WorkerEvent::Flatpaks { flatpaks, note });
+        });
+    }
+
+    fn start_install_appimage(&mut self, source_path: String) {
+        self.loading_action = true;
+        self.set_status("Instalando AppImage em ~/Applications...", false);
+        let em = self.emitter.clone();
         thread::spawn(
             move || match ArchCollectors::install_local_appimage(&source_path) {
-                Ok(msg) => {
-                    let _ = tx.send(WorkerEvent::ActionResult {
-                        message: msg,
+                Ok(message) => {
+                    em.send(WorkerEvent::ActionDone {
+                        message,
                         is_error: false,
                     });
-                    let list = ArchCollectors::collect_appimages();
-                    let _ = tx.send(WorkerEvent::AppImagesUpdated(list));
+                    em.send(WorkerEvent::AppImages(ArchCollectors::collect_appimages()));
                 }
-                Err(err) => {
-                    let _ = tx.send(WorkerEvent::ActionResult {
-                        message: err,
-                        is_error: true,
-                    });
-                }
+                Err(message) => em.send(WorkerEvent::ActionDone {
+                    message,
+                    is_error: true,
+                }),
             },
         );
     }
 
     fn start_chmod_appimage(&mut self, file_path: String) {
-        let tx = self.ensure_channel();
         self.loading_action = true;
-        self.status_message = Some((format!("Aplicando +x em {}...", file_path), false));
-
+        self.set_status(format!("Aplicando +x em {}...", file_path), false);
+        let em = self.emitter.clone();
         thread::spawn(
             move || match ArchCollectors::make_appimage_executable(&file_path) {
-                Ok(msg) => {
-                    let _ = tx.send(WorkerEvent::ActionResult {
-                        message: msg,
+                Ok(message) => {
+                    em.send(WorkerEvent::ActionDone {
+                        message,
                         is_error: false,
                     });
-                    let list = ArchCollectors::collect_appimages();
-                    let _ = tx.send(WorkerEvent::AppImagesUpdated(list));
+                    em.send(WorkerEvent::AppImages(ArchCollectors::collect_appimages()));
                 }
-                Err(err) => {
-                    let _ = tx.send(WorkerEvent::ActionResult {
-                        message: err,
-                        is_error: true,
-                    });
-                }
+                Err(message) => em.send(WorkerEvent::ActionDone {
+                    message,
+                    is_error: true,
+                }),
             },
         );
     }
 
     fn start_install_flatpak(&mut self, app_id: String, remote: String, user_scope: bool) {
-        let tx = self.ensure_channel();
         self.loading_action = true;
-        self.status_message = Some((
+        self.set_status(
             format!(
                 "Instalando Flatpak '{}' via '{}'...",
                 app_id.trim(),
                 remote.trim()
             ),
             false,
-        ));
-
+        );
+        let em = self.emitter.clone();
         thread::spawn(move || {
             match ArchCollectors::install_flatpak_app(&app_id, &remote, user_scope) {
-                Ok(msg) => {
-                    let _ = tx.send(WorkerEvent::ActionResult {
-                        message: msg,
+                Ok(message) => {
+                    em.send(WorkerEvent::ActionDone {
+                        message,
                         is_error: false,
                     });
                     let (flatpaks, note) = ArchCollectors::collect_flatpaks();
-                    let _ = tx.send(WorkerEvent::FlatpaksUpdated { flatpaks, note });
+                    em.send(WorkerEvent::Flatpaks { flatpaks, note });
                 }
-                Err(err) => {
-                    let _ = tx.send(WorkerEvent::ActionResult {
-                        message: err,
-                        is_error: true,
-                    });
-                }
+                Err(message) => em.send(WorkerEvent::ActionDone {
+                    message,
+                    is_error: true,
+                }),
             }
         });
     }
@@ -1552,385 +2150,587 @@ impl ArchAuditorApp {
         ctx.copy_text(md);
 
         match ArchCollectors::export_summary(&self.data) {
-            Ok(path) => {
-                self.status_message = Some((
-                    format!(
-                        "Resumo salvo em {} e copiado para a área de transferência.",
-                        path.display()
-                    ),
-                    false,
-                ));
-            }
-            Err(err) => {
-                self.status_message = Some((err, true));
-            }
+            Ok(path) => self.set_status(
+                format!(
+                    "Resumo salvo em {} e copiado para a área de transferência.",
+                    path.display()
+                ),
+                false,
+            ),
+            Err(err) => self.set_status(err, true),
         }
     }
 
-    fn poll_worker(&mut self, ctx: &egui::Context) {
-        if let Some(rx) = &self.rx {
-            match rx.try_recv() {
-                Ok(WorkerEvent::FullSnapshot(snap)) => {
-                    self.data = snap;
-                    self.loading_full = false;
-                    self.loading_pkg_cache = false;
-                    self.loading_cves = false;
-                    self.loading_action = false;
-                    self.rx = None;
-                    self.status_message = Some(("Auditoria concluída.".to_string(), false));
-                }
-                Ok(WorkerEvent::PackagesCacheUpdated {
-                    packages,
-                    package_notes,
-                    updated_unix,
-                }) => {
-                    self.data.packages = packages;
-                    self.data.package_notes = package_notes;
-                    self.data.last_updated_unix = updated_unix;
-                    self.loading_pkg_cache = false;
-                    self.rx = None;
-                    self.status_message = Some((
-                        format!(
-                            "Cache de pacotes atualizado ({} pendente(s)).",
-                            self.data.packages.len()
-                        ),
+    // ── Eventos dos workers ──
+
+    fn poll_worker(&mut self) {
+        while let Ok(ev) = self.rx.try_recv() {
+            self.apply_event(ev);
+        }
+    }
+
+    fn apply_event(&mut self, ev: WorkerEvent) {
+        match ev {
+            WorkerEvent::Ports { ports, warning } => {
+                self.data.ports = ports;
+                self.data.ports_warning = warning;
+                self.loading_ports = false;
+                self.bump_updated(ArchCollectors::now_unix());
+            }
+            WorkerEvent::Packages {
+                packages,
+                notes,
+                updated_unix,
+            } => {
+                self.data.packages = packages;
+                self.data.package_notes = notes;
+                self.loading_pkgs = false;
+                self.bump_updated(updated_unix);
+                if !self.full_running {
+                    let n = self.data.packages.len();
+                    self.set_status(
+                        format!("Cache de pacotes atualizado ({} pendente(s)).", n),
                         false,
-                    ));
+                    );
                 }
-                Ok(WorkerEvent::CvesUpdated {
-                    result,
-                    updated_unix,
-                }) => {
-                    self.data.vulnerabilities = result.entries;
-                    self.data.vulnerability_note = result.note;
-                    self.data.last_updated_unix = updated_unix;
-                    self.loading_cves = false;
-                    self.rx = None;
-                    self.status_message = Some((
+            }
+            WorkerEvent::Cves {
+                result,
+                updated_unix,
+            } => {
+                self.data.vulnerabilities = result.entries;
+                self.data.vulnerability_note = result.note;
+                self.loading_cves = false;
+                self.bump_updated(updated_unix);
+                if !self.full_running {
+                    let n = self.data.vulnerabilities.len();
+                    self.set_status(
                         format!(
                             "CVEs atualizadas ({} registro(s){}).",
-                            self.data.vulnerabilities.len(),
+                            n,
                             if result.from_cache { ", cache" } else { "" }
                         ),
                         false,
-                    ));
-                }
-                Ok(WorkerEvent::AppImagesUpdated(list)) => {
-                    self.data.appimages = list;
-                    self.loading_action = false;
-                    self.rx = None;
-                }
-                Ok(WorkerEvent::FlatpaksUpdated { flatpaks, note }) => {
-                    self.data.flatpaks = flatpaks;
-                    self.data.flatpak_note = note;
-                    self.loading_action = false;
-                    self.rx = None;
-                }
-                Ok(WorkerEvent::ActionResult { message, is_error }) => {
-                    self.status_message = Some((message, is_error));
-                    if is_error {
-                        self.loading_action = false;
-                        self.rx = None;
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    if self.loading_full
-                        || self.loading_pkg_cache
-                        || self.loading_cves
-                        || self.loading_action
-                    {
-                        ctx.request_repaint_after(Duration::from_millis(120));
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.loading_full = false;
-                    self.loading_pkg_cache = false;
-                    self.loading_cves = false;
-                    self.loading_action = false;
-                    self.rx = None;
+                    );
                 }
             }
+            WorkerEvent::Desktops { desktops, summary } => {
+                self.data.desktops = desktops;
+                self.data.session_summary = summary;
+                self.loading_desktops = false;
+            }
+            WorkerEvent::AppImages(list) => {
+                self.data.appimages = list;
+                self.loading_appimages = false;
+            }
+            WorkerEvent::Flatpaks { flatpaks, note } => {
+                self.data.flatpaks = flatpaks;
+                self.data.flatpak_note = note;
+                self.loading_flatpaks = false;
+            }
+            WorkerEvent::ActionDone { message, is_error } => {
+                self.loading_action = false;
+                self.set_status(message, is_error);
+            }
+        }
+
+        if self.full_running && !self.any_data_loading() {
+            self.full_running = false;
+            self.set_status("Auditoria concluída.", false);
         }
     }
 
-    fn handle_shortcuts(&mut self, ui: &mut egui::Ui, filter_id: egui::Id) {
-        let ctx = ui.ctx();
+    // ── Entrada: atalhos, drag & drop, auto-refresh ──
 
-        ctx.input(|i| {
-            if i.modifiers.contains(Modifiers::CTRL) && i.key_pressed(Key::F) {
-                ctx.memory_mut(|m| m.request_focus(filter_id));
-            }
-            if i.modifiers.contains(Modifiers::CTRL) && i.key_pressed(Key::U) {
-                self.start_pkg_cache_refresh();
-            }
-            if i.modifiers.contains(Modifiers::CTRL)
-                && i.modifiers.contains(Modifiers::SHIFT)
-                && i.key_pressed(Key::C)
-            {
-                self.start_cve_refresh(true);
-            }
-            if i.modifiers.contains(Modifiers::CTRL) && i.key_pressed(Key::E) {
-                self.trigger_export(ctx);
-            }
-            if i.key_pressed(Key::Escape) {
+    fn handle_shortcuts(&mut self, ctx: &egui::Context, filter_id: egui::Id) {
+        let keys = [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+        ];
+        let (focus, upd, cves, export, all, esc, tab_idx) = ctx.input_mut(|i| {
+            let tab_idx = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
+            (
+                i.consume_key(Modifiers::CTRL, Key::F),
+                i.consume_key(Modifiers::CTRL, Key::U),
+                i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::C),
+                i.consume_key(Modifiers::CTRL, Key::E),
+                i.consume_key(Modifiers::NONE, Key::F5),
+                i.key_pressed(Key::Escape),
+                tab_idx,
+            )
+        });
+
+        if focus {
+            ctx.memory_mut(|m| m.request_focus(filter_id));
+        }
+        if upd {
+            self.start_pkgs_refresh();
+        }
+        if cves {
+            self.start_cve_refresh(true);
+        }
+        if export {
+            self.trigger_export(ctx);
+        }
+        if all && !self.any_busy() {
+            self.start_full_refresh(false);
+        }
+        if let Some(i) = tab_idx {
+            self.active_tab = ActiveTab::ALL[i];
+        }
+        if esc {
+            if self.confirm.is_some() {
+                self.confirm = None;
+            } else {
                 self.filter.clear();
             }
-        });
-    }
-
-    fn matches_filter(&self, haystack: &str) -> bool {
-        let q = self.filter.trim().to_lowercase();
-        if q.is_empty() {
-            return true;
         }
-        haystack.to_lowercase().contains(&q)
     }
 
-    fn render_metric_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        title: &str,
-        value: usize,
-        accent: Color32,
-        target_tab: ActiveTab,
-    ) {
-        let selected = self.active_tab == target_tab;
-        let fill = if selected {
-            Color32::from_rgb(28, 38, 50)
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        if let Some(p) = dropped
+            .into_iter()
+            .find(|p| p.to_string_lossy().to_lowercase().ends_with(".appimage"))
+        {
+            self.appimage_source_input = p.display().to_string();
+            self.active_tab = ActiveTab::AppImages;
+            self.set_status(
+                "AppImage recebido — clique em Instalar para copiar para ~/Applications.",
+                false,
+            );
+        }
+    }
+
+    fn maybe_auto_refresh_ports(&mut self, ctx: &egui::Context) {
+        if !(self.auto_refresh_ports && self.active_tab == ActiveTab::Ports) {
+            return;
+        }
+        let elapsed = self.last_ports_refresh.elapsed();
+        if elapsed >= PORTS_AUTO_REFRESH {
+            self.start_ports_refresh();
+            ctx.request_repaint_after(PORTS_AUTO_REFRESH);
         } else {
-            Color32::from_rgb(22, 27, 34)
+            ctx.request_repaint_after(PORTS_AUTO_REFRESH - elapsed);
+        }
+    }
+
+    // ── Cards / abas ──
+
+    fn tab_loading(&self, tab: ActiveTab) -> bool {
+        match tab {
+            ActiveTab::Ports => self.loading_ports,
+            ActiveTab::Packages => self.loading_pkgs,
+            ActiveTab::Vulnerabilities => self.loading_cves,
+            ActiveTab::Desktops => self.loading_desktops,
+            ActiveTab::AppImages => self.loading_appimages,
+            ActiveTab::Flatpaks => self.loading_flatpaks,
+        }
+    }
+
+    fn tab_card_info(&self, tab: ActiveTab) -> (&'static str, String, Color32) {
+        let loading = self.tab_loading(tab);
+        let fmt = |n: usize| -> String {
+            if loading && n == 0 {
+                "…".to_string()
+            } else {
+                n.to_string()
+            }
         };
-        let stroke = if selected {
-            egui::Stroke::new(1.5, accent)
-        } else {
-            egui::Stroke::new(1.0, Color32::from_rgb(48, 54, 61))
-        };
+        match tab {
+            ActiveTab::Ports => {
+                let total = self.data.ports.len();
+                let ext = self
+                    .data
+                    .ports
+                    .iter()
+                    .filter(|p| p.exposure == Exposure::External)
+                    .count();
+                let value = if loading && total == 0 {
+                    "…".to_string()
+                } else {
+                    format!("{} ext · {}", ext, total)
+                };
+                ("PORTAS", value, if ext > 0 { RED } else { GREEN })
+            }
+            ActiveTab::Packages => {
+                let n = self.data.packages.len();
+                ("PACOTES", fmt(n), if n > 0 { ORANGE } else { GREEN })
+            }
+            ActiveTab::Vulnerabilities => {
+                let n = self.data.vulnerabilities.len();
+                ("CVEs", fmt(n), if n > 0 { RED } else { GREEN })
+            }
+            ActiveTab::Desktops => ("WMs / DEs", fmt(self.data.desktops.len()), BLUE),
+            ActiveTab::AppImages => ("APPIMAGES", fmt(self.data.appimages.len()), PURPLE),
+            ActiveTab::Flatpaks => ("FLATPAKS", fmt(self.data.flatpaks.len()), GREEN),
+        }
+    }
+
+    fn render_tab_card(&mut self, ui: &mut egui::Ui, tab: ActiveTab) {
+        let (title, value, accent) = self.tab_card_info(tab);
+        let selected = self.active_tab == tab;
 
         let frame = egui::Frame::NONE
-            .fill(fill)
-            .stroke(stroke)
-            //.rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::symmetric(10, 5));
+            .fill(if selected { CARD_SEL } else { CARD })
+            .stroke(if selected {
+                egui::Stroke::new(1.5, accent)
+            } else {
+                egui::Stroke::new(1.0, BORDER)
+            })
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 6));
 
         let resp = frame.show(ui, |ui| {
+            ui.set_min_width(92.0);
             ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(title)
-                        .size(11.0)
-                        .color(Color32::from_rgb(139, 148, 158)),
-                );
-                ui.label(
-                    RichText::new(value.to_string())
-                        .size(15.0)
-                        .strong()
-                        .color(accent),
-                );
+                ui.label(RichText::new(title).size(11.0).color(MUTED));
+                ui.label(RichText::new(value).size(15.0).strong().color(accent));
             });
         });
 
-        if resp.response.interact(egui::Sense::click()).clicked() {
-            self.active_tab = target_tab;
+        let idx = ActiveTab::ALL.iter().position(|t| *t == tab).unwrap_or(0) + 1;
+        let resp = resp
+            .response
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("{} (Ctrl+{})", tab.label(), idx));
+        if resp.clicked() {
+            self.active_tab = tab;
         }
     }
 
+    // ── Aba: Portas ──
+
     fn render_ports_tab(&mut self, ui: &mut egui::Ui) {
+        let q = self.filter.trim().to_lowercase();
+
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut self.only_external_ports,
-                RichText::new("Mostrar apenas binds externos (0.0.0.0 / [::])").strong(),
+                RichText::new("Somente binds externos (0.0.0.0 / [::])").strong(),
             );
+            ui.checkbox(&mut self.auto_refresh_ports, "Auto-atualizar (5 s)");
+            if self.loading_ports {
+                ui.spinner();
+            }
         });
 
         if let Some(warn) = &self.data.ports_warning {
-            ui.colored_label(Color32::from_rgb(210, 153, 34), format!("⚠ {}", warn));
+            ui.colored_label(ORANGE, format!("⚠ {}", warn));
         }
 
-        ui.add_space(6.0);
+        let only_ext = self.only_external_ports;
+        let mut rows: Vec<&PortEntry> = self
+            .data
+            .ports
+            .iter()
+            .filter(|p| !only_ext || p.exposure == Exposure::External)
+            .filter(|p| q.is_empty() || p.search.contains(&q))
+            .collect();
+
+        count_label(ui, rows.len(), self.data.ports.len());
+        ui.add_space(4.0);
 
         if self.data.ports.is_empty() {
-            ui.label(
-                RichText::new("Nenhuma porta em escuta encontrada para o filtro atual.")
-                    .color(Color32::from_rgb(139, 148, 158)),
+            empty_state(
+                ui,
+                if self.loading_ports {
+                    "Coletando portas em escuta..."
+                } else {
+                    "Nenhuma porta em escuta encontrada."
+                },
             );
             return;
         }
+        if rows.is_empty() {
+            empty_state(ui, "Nenhum resultado para o filtro atual.");
+            return;
+        }
 
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("ports_grid")
+        if let Some(col) = self.ports_sort.col {
+            match col {
+                0 => rows.sort_by_key(|p| match p.exposure {
+                    Exposure::External => 0,
+                    Exposure::Other => 1,
+                    Exposure::Local => 2,
+                }),
+                1 => rows.sort_by(|a, b| a.protocol.cmp(&b.protocol)),
+                2 => rows.sort_by(|a, b| a.local_addr.cmp(&b.local_addr)),
+                3 => rows.sort_by_key(|p| p.port.parse::<u32>().unwrap_or(u32::MAX)),
+                4 => rows.sort_by_cached_key(|p| p.process.to_lowercase()),
+                5 => rows.sort_by_key(|p| {
+                    p.pid
+                        .split(',')
+                        .next()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .unwrap_or(u32::MAX)
+                }),
+                6 => rows.sort_by(|a, b| a.state.cmp(&b.state)),
+                _ => {}
+            }
+            if !self.ports_sort.asc {
+                rows.reverse();
+            }
+        }
+
+        let sort = &mut self.ports_sort;
+        ui.push_id("ports_table", |ui| {
+            TableBuilder::new(ui)
                 .striped(true)
-                .spacing([14.0, 6.0])
-                .show(ui, |ui| {
-                    for header in [
+                .resizable(true)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(170.0))
+                .column(Column::auto().at_least(50.0))
+                .column(Column::auto().at_least(120.0))
+                .column(Column::auto().at_least(60.0))
+                .column(Column::auto().at_least(140.0))
+                .column(Column::auto().at_least(60.0))
+                .column(Column::remainder())
+                .header(26.0, |mut header| {
+                    for (i, t) in [
                         "Exposição",
                         "Proto",
-                        "Endereço Local",
+                        "Endereço local",
                         "Porta",
                         "Processo",
                         "PID",
                         "Estado",
-                    ] {
-                        ui.strong(header);
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        header.col(|ui| sort_header(ui, t, i, sort));
                     }
-                    ui.end_row();
-
-                    for p in &self.data.ports {
-                        if self.only_external_ports && p.exposure != Exposure::External {
-                            continue;
-                        }
-                        let row_blob = format!(
-                            "{} {} {} {} {}",
-                            p.protocol, p.local_addr, p.port, p.process, p.pid
-                        );
-                        if !self.matches_filter(&row_blob) {
-                            continue;
-                        }
-
+                })
+                .body(|body| {
+                    body.rows(24.0, rows.len(), |mut row| {
+                        let p = rows[row.index()];
                         let (badge_txt, badge_color, addr_color) = match p.exposure {
-                            Exposure::External => (
-                                "⚠ EXTERNA (0.0.0.0/[::])",
-                                Color32::from_rgb(255, 123, 114),
-                                Color32::from_rgb(255, 166, 87),
-                            ),
-                            Exposure::Local => (
-                                "● LOCAL",
-                                Color32::from_rgb(63, 185, 80),
-                                Color32::from_rgb(139, 148, 158),
-                            ),
-                            Exposure::Other => (
-                                "◈ INTERFACE",
-                                Color32::from_rgb(121, 192, 255),
-                                Color32::from_rgb(121, 192, 255),
-                            ),
+                            Exposure::External => ("⚠ EXTERNA (0.0.0.0/[::])", RED, AMBER),
+                            Exposure::Local => ("● LOCAL", GREEN, MUTED),
+                            Exposure::Other => ("◈ INTERFACE", BLUE, BLUE),
                         };
-
-                        ui.label(RichText::new(badge_txt).color(badge_color).strong());
-                        ui.label(&p.protocol);
-                        ui.label(RichText::new(&p.local_addr).color(addr_color).monospace());
-                        ui.label(
-                            RichText::new(&p.port)
-                                .color(badge_color)
-                                .strong()
-                                .monospace(),
-                        );
-                        ui.label(RichText::new(&p.process).strong());
-                        ui.label(RichText::new(&p.pid).monospace());
-                        ui.label(&p.state);
-                        ui.end_row();
-                    }
+                        row.col(|ui| {
+                            ui.label(RichText::new(badge_txt).color(badge_color).strong());
+                        });
+                        row.col(|ui| {
+                            ui.label(&p.protocol);
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&p.local_addr).color(addr_color).monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(
+                                RichText::new(&p.port)
+                                    .color(badge_color)
+                                    .strong()
+                                    .monospace(),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&p.process).strong());
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&p.pid).monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(&p.state);
+                        });
+                        row.response().context_menu(|ui| {
+                            if ui.button("Copiar porta").clicked() {
+                                ui.ctx().copy_text(p.port.clone());
+                                ui.close();
+                            }
+                            if ui.button("Copiar endereço:porta").clicked() {
+                                ui.ctx().copy_text(format!("{}:{}", p.local_addr, p.port));
+                                ui.close();
+                            }
+                            if ui.button("Copiar PID").clicked() {
+                                ui.ctx().copy_text(p.pid.clone());
+                                ui.close();
+                            }
+                            if ui.button("Copiar processo").clicked() {
+                                ui.ctx().copy_text(p.process.clone());
+                                ui.close();
+                            }
+                        });
+                    });
                 });
         });
     }
 
+    // ── Aba: Pacotes ──
+
     fn render_packages_tab(&mut self, ui: &mut egui::Ui) {
+        let q = self.filter.trim().to_lowercase();
+
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !self.loading_pkg_cache && !self.loading_full,
-                    egui::Button::new("📦 Atualizar Cache de Pacotes (Ctrl+U)"),
+                    !self.loading_pkgs,
+                    egui::Button::new("Atualizar pacotes (Ctrl+U)"),
                 )
                 .clicked()
             {
-                self.start_pkg_cache_refresh();
+                self.start_pkgs_refresh();
             }
-            if self.loading_pkg_cache {
+            if self.loading_pkgs {
                 ui.spinner();
                 ui.label("Consultando checkupdates / AUR...");
             }
         });
 
-        ui.add_space(4.0);
-
         if self.data.packages.is_empty() {
-            ui.label(
-                RichText::new("Nenhum pacote desatualizado encontrado ou lista vazia.")
-                    .color(Color32::from_rgb(63, 185, 80)),
-            );
+            if !self.loading_pkgs {
+                ui.label(RichText::new("Nenhum pacote desatualizado encontrado.").color(GREEN));
+            }
         } else {
             ui.label(
                 RichText::new(format!(
                     "{} pacote(s) desatualizado(s).",
                     self.data.packages.len()
                 ))
-                .color(Color32::from_rgb(210, 153, 34))
+                .color(ORANGE)
                 .strong(),
             );
         }
-
         for note in &self.data.package_notes {
-            ui.label(RichText::new(format!("• {}", note)).color(Color32::from_rgb(139, 148, 158)));
+            ui.label(RichText::new(format!("• {}", note)).color(MUTED));
         }
 
-        ui.add_space(6.0);
+        let mut rows: Vec<&PackageEntry> = self
+            .data
+            .packages
+            .iter()
+            .filter(|p| q.is_empty() || p.search.contains(&q))
+            .collect();
 
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("packages_grid")
+        if !self.data.packages.is_empty() {
+            count_label(ui, rows.len(), self.data.packages.len());
+        }
+        ui.add_space(4.0);
+
+        if self.data.packages.is_empty() {
+            return;
+        }
+        if rows.is_empty() {
+            empty_state(ui, "Nenhum resultado para o filtro atual.");
+            return;
+        }
+
+        if let Some(col) = self.pkgs_sort.col {
+            match col {
+                0 => rows.sort_by(|a, b| a.source.cmp(&b.source)),
+                1 => rows.sort_by_cached_key(|p| p.name.to_lowercase()),
+                2 => rows.sort_by(|a, b| a.current_ver.cmp(&b.current_ver)),
+                3 => rows.sort_by(|a, b| a.new_ver.cmp(&b.new_ver)),
+                _ => {}
+            }
+            if !self.pkgs_sort.asc {
+                rows.reverse();
+            }
+        }
+
+        let sort = &mut self.pkgs_sort;
+        ui.push_id("packages_table", |ui| {
+            TableBuilder::new(ui)
                 .striped(true)
-                .spacing([14.0, 6.0])
-                .show(ui, |ui| {
-                    for h in ["Origem", "Pacote", "Versão Atual", "Nova Versão"] {
-                        ui.strong(h);
+                .resizable(true)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(110.0))
+                .column(Column::auto().at_least(220.0))
+                .column(Column::auto().at_least(150.0))
+                .column(Column::remainder())
+                .header(26.0, |mut header| {
+                    for (i, t) in ["Origem", "Pacote", "Versão atual", "Nova versão"]
+                        .iter()
+                        .enumerate()
+                    {
+                        header.col(|ui| sort_header(ui, t, i, sort));
                     }
-                    ui.end_row();
-
-                    for pkg in &self.data.packages {
-                        let blob = format!(
-                            "{} {} {} {}",
-                            pkg.source, pkg.name, pkg.current_ver, pkg.new_ver
-                        );
-                        if !self.matches_filter(&blob) {
-                            continue;
-                        }
+                })
+                .body(|body| {
+                    body.rows(24.0, rows.len(), |mut row| {
+                        let pkg = rows[row.index()];
                         let src_color = if pkg.source == "Oficial" {
-                            Color32::from_rgb(23, 147, 209)
+                            ARCH
                         } else {
-                            Color32::from_rgb(210, 168, 255)
+                            PURPLE
                         };
-                        ui.label(RichText::new(&pkg.source).color(src_color).strong());
-                        ui.label(RichText::new(&pkg.name).strong().monospace());
-                        ui.label(RichText::new(&pkg.current_ver).monospace());
-                        ui.label(
-                            RichText::new(&pkg.new_ver)
-                                .color(Color32::from_rgb(63, 185, 80))
-                                .strong()
-                                .monospace(),
-                        );
-                        ui.end_row();
-                    }
+                        row.col(|ui| {
+                            ui.label(RichText::new(&pkg.source).color(src_color).strong());
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&pkg.name).strong().monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&pkg.current_ver).monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(
+                                RichText::new(&pkg.new_ver)
+                                    .color(GREEN)
+                                    .strong()
+                                    .monospace(),
+                            );
+                        });
+                        row.response().context_menu(|ui| {
+                            if ui.button("Copiar nome do pacote").clicked() {
+                                ui.ctx().copy_text(pkg.name.clone());
+                                ui.close();
+                            }
+                            if ui.button("Copiar nova versão").clicked() {
+                                ui.ctx().copy_text(pkg.new_ver.clone());
+                                ui.close();
+                            }
+                        });
+                    });
                 });
         });
     }
 
+    // ── Aba: CVEs ──
+
     fn render_vulnerabilities_tab(&mut self, ui: &mut egui::Ui) {
+        let q = self.filter.trim().to_lowercase();
         let mut url_to_open: Option<String> = None;
 
-        let quick_frame = egui::Frame::NONE
-            .fill(Color32::from_rgb(22, 27, 34))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(48, 54, 61)))
-            //.rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::same(10));
-
-        quick_frame.show(ui, |ui| {
-            ui.strong("Abrir CVE ou Pacote diretamente no security.archlinux.org");
+        card_frame().show(ui, |ui| {
+            ui.strong("Abrir CVE ou pacote diretamente no security.archlinux.org");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.add(
+                let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.cve_lookup_input)
                         .hint_text("Ex.: CVE-2024-3094 ou openssl")
-                        .desired_width(240.0),
+                        .desired_width(260.0),
                 );
-                if ui.button("↗ Abrir no Navegador").clicked() {
-                    let q = self.cve_lookup_input.trim();
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if ui.button("↗ Abrir no navegador").clicked() || enter {
+                    let q = self.cve_lookup_input.trim().to_string();
                     if q.is_empty() {
-                        self.status_message = Some((
-                            "Digite um CVE (ex.: CVE-2024-3094) ou nome de pacote.".to_string(),
+                        self.set_status(
+                            "Digite um CVE (ex.: CVE-2024-3094) ou nome de pacote.",
                             true,
-                        ));
+                        );
                     } else {
-                        url_to_open = Some(ArchCollectors::advisory_url_from_query(q, q));
+                        url_to_open = Some(ArchCollectors::advisory_url_from_query(&q, &q));
                     }
                 }
                 if ui
-                    .small_button("Exemplo CVE")
+                    .small_button("Exemplo")
                     .on_hover_text("Preenche CVE-2024-3094 para teste")
                     .clicked()
                 {
@@ -1944,8 +2744,8 @@ impl ArchAuditorApp {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !self.loading_cves && !self.loading_full,
-                    egui::Button::new("🛡 Atualizar CVEs (Ctrl+Shift+C)"),
+                    !self.loading_cves,
+                    egui::Button::new("Atualizar CVEs (Ctrl+Shift+C)"),
                 )
                 .clicked()
             {
@@ -1962,253 +2762,376 @@ impl ArchAuditorApp {
         });
 
         if let Some(note) = &self.data.vulnerability_note {
-            ui.colored_label(Color32::from_rgb(139, 148, 158), format!("ℹ {}", note));
+            ui.colored_label(MUTED, format!("ℹ {}", note));
         }
 
-        ui.add_space(6.0);
+        let only_high = self.only_high_cve;
+        let mut rows: Vec<&CveVulnerabilityEntry> = self
+            .data
+            .vulnerabilities
+            .iter()
+            .filter(|v| !only_high || is_high_severity(&v.severity))
+            .filter(|v| q.is_empty() || v.search.contains(&q))
+            .collect();
+
+        if !self.data.vulnerabilities.is_empty() {
+            count_label(ui, rows.len(), self.data.vulnerabilities.len());
+        }
+        ui.add_space(4.0);
 
         if self.data.vulnerabilities.is_empty() {
-            ui.label(
-                RichText::new(
-                    "Nenhuma vulnerabilidade CVE listada no momento. Use o campo acima para abrir um CVE/pacote diretamente ou clique em 'Atualizar CVEs'.",
-                )
-                .color(Color32::from_rgb(139, 148, 158)),
+            empty_state(
+                ui,
+                if self.loading_cves {
+                    "Consultando vulnerabilidades..."
+                } else {
+                    "Nenhuma vulnerabilidade CVE listada. Use o campo acima ou clique em 'Atualizar CVEs'."
+                },
             );
+        } else if rows.is_empty() {
+            empty_state(ui, "Nenhum resultado para o filtro atual.");
         } else {
-            egui::ScrollArea::both().show(ui, |ui| {
-                egui::Grid::new("cves_grid")
+            if let Some(col) = self.cves_sort.col {
+                match col {
+                    0 => rows.sort_by_key(|v| sev_rank(&v.severity)),
+                    1 => rows.sort_by_cached_key(|v| v.package.to_lowercase()),
+                    2 => rows.sort_by(|a, b| a.status.cmp(&b.status)),
+                    3 => rows.sort_by(|a, b| a.fixed_ver.cmp(&b.fixed_ver)),
+                    4 => rows.sort_by(|a, b| a.cves.cmp(&b.cves)),
+                    _ => {}
+                }
+                if !self.cves_sort.asc {
+                    rows.reverse();
+                }
+            }
+
+            let sort = &mut self.cves_sort;
+            ui.push_id("cves_table", |ui| {
+                TableBuilder::new(ui)
                     .striped(true)
-                    .spacing([14.0, 6.0])
-                    .show(ui, |ui| {
-                        for h in [
-                            "Severidade",
-                            "Pacote",
-                            "Status",
-                            "Correção",
-                            "CVEs / Detalhe",
-                            "Advisory",
-                        ] {
-                            ui.strong(h);
+                    .resizable(true)
+                    .sense(egui::Sense::click())
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::auto().at_least(90.0))
+                    .column(Column::auto().at_least(150.0))
+                    .column(Column::auto().at_least(130.0))
+                    .column(Column::auto().at_least(110.0))
+                    .column(Column::auto().at_least(220.0).clip(true))
+                    .column(Column::remainder())
+                    .header(26.0, |mut header| {
+                        for (i, t) in ["Severidade", "Pacote", "Status", "Correção", "CVEs"]
+                            .iter()
+                            .enumerate()
+                        {
+                            header.col(|ui| sort_header(ui, t, i, sort));
                         }
-                        ui.end_row();
-
-                        for v in &self.data.vulnerabilities {
-                            let sev_low = v.severity.to_lowercase();
-                            if self.only_high_cve && !(sev_low == "high" || sev_low == "critical") {
-                                continue;
-                            }
-                            let blob = format!(
-                                "{} {} {} {} {} {}",
-                                v.package, v.severity, v.status, v.fixed_ver, v.cves, v.detail
-                            );
-                            if !self.matches_filter(&blob) {
-                                continue;
-                            }
-
-                            let sev_color = match sev_low.as_str() {
-                                "high" | "critical" => Color32::from_rgb(255, 123, 114),
-                                "medium" => Color32::from_rgb(210, 153, 34),
-                                "low" => Color32::from_rgb(121, 192, 255),
-                                _ => Color32::from_rgb(139, 148, 158),
-                            };
-
-                            ui.label(RichText::new(&v.severity).color(sev_color).strong());
-                            ui.label(RichText::new(&v.package).strong().monospace());
-                            ui.label(&v.status);
-                            ui.label(RichText::new(&v.fixed_ver).monospace());
-                            ui.label(RichText::new(&v.cves).color(sev_color).monospace())
-                                .on_hover_text(&v.detail);
-
-                            let url = ArchCollectors::advisory_url(v);
-                            if ui
-                                .button("↗ Abrir Advisory")
-                                .on_hover_text(format!("Abrir {} via xdg-open", url))
-                                .clicked()
-                            {
-                                url_to_open = Some(url);
-                            }
-                            ui.end_row();
-                        }
+                        header.col(|ui| {
+                            ui.strong("Advisory");
+                        });
+                    })
+                    .body(|body| {
+                        body.rows(24.0, rows.len(), |mut row| {
+                            let v = rows[row.index()];
+                            let color = sev_color(&v.severity);
+                            row.col(|ui| {
+                                ui.label(RichText::new(&v.severity).color(color).strong());
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(&v.package).strong().monospace());
+                            });
+                            row.col(|ui| {
+                                ui.label(&v.status);
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(&v.fixed_ver).monospace());
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(&v.cves).color(color).monospace())
+                                    .on_hover_text(&v.detail);
+                            });
+                            row.col(|ui| {
+                                let url = ArchCollectors::advisory_url(v);
+                                if ui
+                                    .small_button("↗ Abrir")
+                                    .on_hover_text(format!("Abrir {} via xdg-open", url))
+                                    .clicked()
+                                {
+                                    url_to_open = Some(url);
+                                }
+                            });
+                            row.response().context_menu(|ui| {
+                                if ui.button("Copiar pacote").clicked() {
+                                    ui.ctx().copy_text(v.package.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Copiar CVEs").clicked() {
+                                    ui.ctx().copy_text(v.cves.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Copiar link do advisory").clicked() {
+                                    ui.ctx().copy_text(ArchCollectors::advisory_url(v));
+                                    ui.close();
+                                }
+                            });
+                        });
                     });
             });
         }
 
         if let Some(url) = url_to_open {
             match ArchCollectors::open_in_browser(&url) {
-                Ok(()) => {
-                    self.status_message = Some((format!("Abrindo {} via xdg-open...", url), false));
-                }
-                Err(err) => {
-                    self.status_message = Some((err, true));
-                }
+                Ok(()) => self.set_status(format!("Abrindo {} via xdg-open...", url), false),
+                Err(err) => self.set_status(err, true),
             }
         }
     }
 
+    // ── Aba: WMs / DEs ──
+
     fn render_desktops_tab(&self, ui: &mut egui::Ui) {
+        let q = self.filter.trim().to_lowercase();
+
         if !self.data.session_summary.is_empty() {
             ui.label(
                 RichText::new(&self.data.session_summary)
-                    .color(Color32::from_rgb(23, 147, 209))
+                    .color(ARCH)
                     .strong(),
             );
-            ui.add_space(6.0);
         }
 
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("desktops_grid")
+        let rows: Vec<&DesktopEntryItem> = self
+            .data
+            .desktops
+            .iter()
+            .filter(|d| q.is_empty() || d.search.contains(&q))
+            .collect();
+
+        count_label(ui, rows.len(), self.data.desktops.len());
+        ui.add_space(4.0);
+
+        if self.data.desktops.is_empty() {
+            empty_state(
+                ui,
+                if self.loading_desktops {
+                    "Procurando WMs e ambientes..."
+                } else {
+                    "Nenhum WM/DE detectado."
+                },
+            );
+            return;
+        }
+        if rows.is_empty() {
+            empty_state(ui, "Nenhum resultado para o filtro atual.");
+            return;
+        }
+
+        ui.push_id("desktops_table", |ui| {
+            TableBuilder::new(ui)
                 .striped(true)
-                .spacing([14.0, 6.0])
-                .show(ui, |ui| {
-                    for h in ["Status", "Ambiente / WM", "Sessão", "Executável", "Origem"] {
-                        ui.strong(h);
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(90.0))
+                .column(Column::auto().at_least(180.0))
+                .column(Column::auto().at_least(100.0))
+                .column(Column::auto().at_least(180.0))
+                .column(Column::remainder())
+                .header(26.0, |mut header| {
+                    for t in ["Status", "Ambiente / WM", "Sessão", "Executável", "Origem"] {
+                        header.col(|ui| {
+                            ui.strong(t);
+                        });
                     }
-                    ui.end_row();
-
-                    for d in &self.data.desktops {
-                        let blob = format!(
-                            "{} {} {} {}",
-                            d.name, d.session_type, d.binary, d.source_path
-                        );
-                        if !self.matches_filter(&blob) {
-                            continue;
-                        }
-
-                        if d.active {
-                            ui.label(
-                                RichText::new("★ ATIVA")
-                                    .color(Color32::from_rgb(63, 185, 80))
-                                    .strong(),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("Instalado").color(Color32::from_rgb(139, 148, 158)),
-                            );
-                        }
-                        ui.label(RichText::new(&d.name).strong());
-                        ui.label(&d.session_type);
-                        ui.label(RichText::new(&d.binary).monospace());
-                        ui.label(
-                            RichText::new(&d.source_path).color(Color32::from_rgb(139, 148, 158)),
-                        );
-                        ui.end_row();
-                    }
+                })
+                .body(|body| {
+                    body.rows(24.0, rows.len(), |mut row| {
+                        let d = rows[row.index()];
+                        row.col(|ui| {
+                            if d.active {
+                                ui.label(RichText::new("★ ATIVA").color(GREEN).strong());
+                            } else {
+                                ui.label(RichText::new("Instalado").color(MUTED));
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&d.name).strong());
+                        });
+                        row.col(|ui| {
+                            ui.label(&d.session_type);
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&d.binary).monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&d.source_path).color(MUTED));
+                        });
+                    });
                 });
         });
     }
 
-    fn render_appimages_tab(&mut self, ui: &mut egui::Ui) {
-        let frame = egui::Frame::NONE
-            .fill(Color32::from_rgb(22, 27, 34))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(48, 54, 61)))
-            //.rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::same(10));
+    // ── Aba: AppImages ──
 
-        frame.show(ui, |ui| {
+    fn render_appimages_tab(&mut self, ui: &mut egui::Ui) {
+        let q = self.filter.trim().to_lowercase();
+        let mut request_install: Option<String> = None;
+
+        card_frame().show(ui, |ui| {
             ui.strong("Instalar AppImage local em ~/Applications (+x)");
+            ui.label(
+                RichText::new("Dica: arraste um arquivo .AppImage para a janela.")
+                    .color(MUTED)
+                    .small(),
+            );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.appimage_source_input)
                         .hint_text("/caminho/para/aplicativo.AppImage")
-                        .desired_width(360.0),
+                        .desired_width(380.0),
                 );
                 if ui
                     .add_enabled(
-                        !self.loading_action && !self.loading_full,
+                        !self.loading_action,
                         egui::Button::new("⬇ Instalar AppImage"),
                     )
                     .clicked()
                 {
-                    let src = self.appimage_source_input.clone();
-                    self.start_install_appimage(src);
+                    request_install = Some(
+                        self.appimage_source_input
+                            .trim()
+                            .trim_matches('"')
+                            .to_string(),
+                    );
                 }
             });
         });
+
+        if let Some(src) = request_install {
+            if src.is_empty() {
+                self.set_status("Informe o caminho de um arquivo .AppImage.", true);
+            } else {
+                self.confirm = Some(Confirm::AppImage(src));
+            }
+        }
 
         ui.add_space(6.0);
         ui.label(
             RichText::new(
                 "Diretórios monitorados: ~/Applications, ~/Downloads, ~/Desktop, ~/.local/bin e /opt",
             )
-            .color(Color32::from_rgb(139, 148, 158)),
+            .color(MUTED),
         );
-        ui.add_space(6.0);
+
+        let rows: Vec<&AppImageEntry> = self
+            .data
+            .appimages
+            .iter()
+            .filter(|a| q.is_empty() || a.search.contains(&q))
+            .collect();
+
+        count_label(ui, rows.len(), self.data.appimages.len());
+        ui.add_space(4.0);
 
         let mut chmod_target: Option<String> = None;
 
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("appimages_grid")
-                .striped(true)
-                .spacing([14.0, 6.0])
-                .show(ui, |ui| {
-                    for h in [
-                        "Permissão (+x)",
-                        "Arquivo",
-                        "Tamanho",
-                        "Caminho Completo",
-                        "Ação",
-                    ] {
-                        ui.strong(h);
-                    }
-                    ui.end_row();
-
-                    for app in &self.data.appimages {
-                        let blob = format!("{} {}", app.name, app.path);
-                        if !self.matches_filter(&blob) {
-                            continue;
+        if self.data.appimages.is_empty() {
+            empty_state(
+                ui,
+                if self.loading_appimages {
+                    "Procurando AppImages..."
+                } else {
+                    "Nenhum .AppImage encontrado nos diretórios monitorados."
+                },
+            );
+        } else if rows.is_empty() {
+            empty_state(ui, "Nenhum resultado para o filtro atual.");
+        } else {
+            ui.push_id("appimages_table", |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .sense(egui::Sense::click())
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::auto().at_least(130.0))
+                    .column(Column::auto().at_least(200.0))
+                    .column(Column::auto().at_least(80.0))
+                    .column(Column::auto().at_least(260.0).clip(true))
+                    .column(Column::remainder())
+                    .header(26.0, |mut header| {
+                        for t in [
+                            "Permissão",
+                            "Arquivo",
+                            "Tamanho",
+                            "Caminho completo",
+                            "Ação",
+                        ] {
+                            header.col(|ui| {
+                                ui.strong(t);
+                            });
                         }
-                        if app.executable {
-                            ui.label(
-                                RichText::new("✔ Executável (+x)")
-                                    .color(Color32::from_rgb(63, 185, 80))
-                                    .strong(),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("✖ Sem +x")
-                                    .color(Color32::from_rgb(210, 153, 34))
-                                    .strong(),
-                            );
-                        }
-                        ui.label(RichText::new(&app.name).strong());
-                        ui.label(RichText::new(&app.size_human).monospace());
-                        ui.label(RichText::new(&app.path).monospace());
-
-                        if !app.executable {
-                            if ui.small_button("Habilitar +x").clicked() {
-                                chmod_target = Some(app.path.clone());
-                            }
-                        } else {
-                            ui.label(
-                                RichText::new("Pronto").color(Color32::from_rgb(139, 148, 158)),
-                            );
-                        }
-                        ui.end_row();
-                    }
-                });
-        });
+                    })
+                    .body(|body| {
+                        body.rows(26.0, rows.len(), |mut row| {
+                            let app = rows[row.index()];
+                            row.col(|ui| {
+                                if app.executable {
+                                    ui.label(RichText::new("✔ Executável").color(GREEN).strong());
+                                } else {
+                                    ui.label(RichText::new("✖ Sem +x").color(ORANGE).strong());
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(&app.name).strong());
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(&app.size_human).monospace());
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(&app.path).monospace());
+                            });
+                            row.col(|ui| {
+                                if !app.executable {
+                                    if ui.small_button("Habilitar +x").clicked() {
+                                        chmod_target = Some(app.path.clone());
+                                    }
+                                } else {
+                                    ui.label(RichText::new("Pronto").color(MUTED));
+                                }
+                            });
+                            row.response().context_menu(|ui| {
+                                if ui.button("Copiar caminho").clicked() {
+                                    ui.ctx().copy_text(app.path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Copiar nome").clicked() {
+                                    ui.ctx().copy_text(app.name.clone());
+                                    ui.close();
+                                }
+                            });
+                        });
+                    });
+            });
+        }
 
         if let Some(p) = chmod_target {
             self.start_chmod_appimage(p);
         }
     }
 
-    fn render_flatpaks_tab(&mut self, ui: &mut egui::Ui) {
-        let frame = egui::Frame::NONE
-            .fill(Color32::from_rgb(22, 27, 34))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(48, 54, 61)))
-            //.rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::same(10));
+    // ── Aba: Flatpaks ──
 
-        frame.show(ui, |ui| {
+    fn render_flatpaks_tab(&mut self, ui: &mut egui::Ui) {
+        let q = self.filter.trim().to_lowercase();
+        let mut request_install: Option<(String, String, bool)> = None;
+
+        card_frame().show(ui, |ui| {
             ui.strong("Instalar aplicativo Flatpak");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.flatpak_id_input)
                         .hint_text("Application ID (ex.: org.mozilla.firefox)")
-                        .desired_width(260.0),
+                        .desired_width(280.0),
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut self.flatpak_remote_input)
@@ -2217,24 +3140,47 @@ impl ArchAuditorApp {
                 );
                 ui.checkbox(&mut self.flatpak_user_scope, "Escopo --user");
                 if ui
-                    .add_enabled(
-                        !self.loading_action && !self.loading_full,
-                        egui::Button::new("📦 Instalar Flatpak"),
-                    )
+                    .add_enabled(!self.loading_action, egui::Button::new("Instalar Flatpak"))
                     .clicked()
                 {
-                    let app_id = self.flatpak_id_input.clone();
-                    let remote = self.flatpak_remote_input.clone();
-                    let scope = self.flatpak_user_scope;
-                    self.start_install_flatpak(app_id, remote, scope);
+                    request_install = Some((
+                        self.flatpak_id_input.trim().to_string(),
+                        self.flatpak_remote_input.trim().to_string(),
+                        self.flatpak_user_scope,
+                    ));
                 }
             });
         });
 
+        if let Some((app_id, remote, user_scope)) = request_install {
+            let remote = if remote.is_empty() {
+                "flathub".to_string()
+            } else {
+                remote
+            };
+            if app_id.is_empty() {
+                self.set_status(
+                    "Informe um Application ID válido (ex.: org.mozilla.firefox).",
+                    true,
+                );
+            } else if !valid_flatpak_token(&app_id) || !valid_flatpak_token(&remote) {
+                self.set_status(
+                    "Application ID/remote inválido: use apenas letras, números, '.', '_' e '-'.",
+                    true,
+                );
+            } else {
+                self.confirm = Some(Confirm::Flatpak {
+                    app_id,
+                    remote,
+                    user_scope,
+                });
+            }
+        }
+
         ui.add_space(6.0);
 
         if let Some(note) = &self.data.flatpak_note {
-            ui.label(RichText::new(note).color(Color32::from_rgb(139, 148, 158)));
+            ui.label(RichText::new(note).color(MUTED));
         } else {
             ui.label(
                 RichText::new(format!(
@@ -2245,14 +3191,43 @@ impl ArchAuditorApp {
             );
         }
 
-        ui.add_space(6.0);
+        let rows: Vec<&FlatpakEntry> = self
+            .data
+            .flatpaks
+            .iter()
+            .filter(|f| q.is_empty() || f.search.contains(&q))
+            .collect();
 
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("flatpaks_grid")
+        if !self.data.flatpaks.is_empty() {
+            count_label(ui, rows.len(), self.data.flatpaks.len());
+        }
+        ui.add_space(4.0);
+
+        if self.data.flatpaks.is_empty() {
+            if self.loading_flatpaks {
+                empty_state(ui, "Consultando Flatpaks...");
+            }
+            return;
+        }
+        if rows.is_empty() {
+            empty_state(ui, "Nenhum resultado para o filtro atual.");
+            return;
+        }
+
+        ui.push_id("flatpaks_table", |ui| {
+            TableBuilder::new(ui)
                 .striped(true)
-                .spacing([14.0, 6.0])
-                .show(ui, |ui| {
-                    for h in [
+                .resizable(true)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(160.0))
+                .column(Column::auto().at_least(240.0))
+                .column(Column::auto().at_least(90.0))
+                .column(Column::auto().at_least(80.0))
+                .column(Column::auto().at_least(100.0))
+                .column(Column::remainder())
+                .header(26.0, |mut header| {
+                    for t in [
                         "Nome",
                         "Application ID",
                         "Versão",
@@ -2260,140 +3235,194 @@ impl ArchAuditorApp {
                         "Repositório",
                         "Escopo",
                     ] {
-                        ui.strong(h);
+                        header.col(|ui| {
+                            ui.strong(t);
+                        });
                     }
-                    ui.end_row();
-
-                    for fp in &self.data.flatpaks {
-                        let blob = format!(
-                            "{} {} {} {}",
-                            fp.name, fp.app_id, fp.origin, fp.installation
-                        );
-                        if !self.matches_filter(&blob) {
-                            continue;
-                        }
-                        ui.label(RichText::new(&fp.name).strong());
-                        ui.label(RichText::new(&fp.app_id).monospace());
-                        ui.label(RichText::new(&fp.version).monospace());
-                        ui.label(&fp.branch);
-                        ui.label(&fp.origin);
-                        ui.label(&fp.installation);
-                        ui.end_row();
-                    }
+                })
+                .body(|body| {
+                    body.rows(24.0, rows.len(), |mut row| {
+                        let fp = rows[row.index()];
+                        row.col(|ui| {
+                            ui.label(RichText::new(&fp.name).strong());
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&fp.app_id).monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&fp.version).monospace());
+                        });
+                        row.col(|ui| {
+                            ui.label(&fp.branch);
+                        });
+                        row.col(|ui| {
+                            ui.label(&fp.origin);
+                        });
+                        row.col(|ui| {
+                            ui.label(&fp.installation);
+                        });
+                        row.response().context_menu(|ui| {
+                            if ui.button("Copiar Application ID").clicked() {
+                                ui.ctx().copy_text(fp.app_id.clone());
+                                ui.close();
+                            }
+                            if ui.button("Copiar nome").clicked() {
+                                ui.ctx().copy_text(fp.name.clone());
+                                ui.close();
+                            }
+                        });
+                    });
                 });
         });
+    }
+
+    // ── Diálogo de confirmação ──
+
+    fn render_confirm(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = self.confirm.clone() else {
+            return;
+        };
+
+        let (title, body) = match &confirm {
+            Confirm::AppImage(path) => (
+                "Instalar AppImage",
+                format!(
+                    "Copiar o arquivo abaixo para ~/Applications e torná-lo executável (+x)?\n\n{}",
+                    path
+                ),
+            ),
+            Confirm::Flatpak {
+                app_id,
+                remote,
+                user_scope,
+            } => (
+                "Instalar Flatpak",
+                format!(
+                    "Instalar '{}' a partir de '{}' no escopo {}?{}",
+                    app_id,
+                    remote,
+                    if *user_scope { "usuário" } else { "sistema" },
+                    if *user_scope {
+                        ""
+                    } else {
+                        "\n\nO escopo de sistema pode exigir autenticação (polkit)."
+                    }
+                ),
+            ),
+        };
+
+        let mut decision: Option<bool> = None;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(body);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Confirmar").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancelar (Esc)").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+
+        match decision {
+            Some(true) => {
+                self.confirm = None;
+                match confirm {
+                    Confirm::AppImage(path) => self.start_install_appimage(path),
+                    Confirm::Flatpak {
+                        app_id,
+                        remote,
+                        user_scope,
+                    } => self.start_install_flatpak(app_id, remote, user_scope),
+                }
+            }
+            Some(false) => self.confirm = None,
+            None => {}
+        }
     }
 }
 
 impl eframe::App for ArchAuditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_worker(ui.ctx());
+        let ctx = ui.ctx().clone();
         let filter_id = egui::Id::unique("search_filter_input");
-        self.handle_shortcuts(ui, filter_id);
 
-        let external_count = self
-            .data
-            .ports
-            .iter()
-            .filter(|p| p.exposure == Exposure::External)
-            .count();
-        let cve_count = self.data.vulnerabilities.len();
-        let pkg_count = self.data.packages.len();
-        let wm_count = self.data.desktops.len();
-        let app_count = self.data.appimages.len();
-        let fp_count = self.data.flatpaks.len();
-        let any_busy =
-            self.loading_full || self.loading_pkg_cache || self.loading_cves || self.loading_action;
+        self.poll_worker();
+        self.handle_dropped_files(&ctx);
+        self.handle_shortcuts(&ctx, filter_id);
+        self.maybe_auto_refresh_ports(&ctx);
+        self.expire_status(&ctx);
+
+        let any_busy = self.any_busy();
 
         egui::Panel::top("top_panel").show(ui, |ui| {
             ui.add_space(6.0);
+
+            // Linha 1: título + ações
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("󰣇 ARCH VISUAL AUDITOR")
-                        .color(Color32::from_rgb(23, 147, 209))
+                    RichText::new("ARCH VISUAL AUDITOR")
+                        .color(ARCH)
                         .strong()
                         .size(16.0),
                 );
-                ui.add_space(8.0);
-
-                let exp_color = if external_count > 0 {
-                    Color32::from_rgb(255, 123, 114)
-                } else {
-                    Color32::from_rgb(63, 185, 80)
-                };
-                self.render_metric_card(
-                    ui,
-                    "EXTERNAS",
-                    external_count,
-                    exp_color,
-                    ActiveTab::Ports,
-                );
-                self.render_metric_card(
-                    ui,
-                    "UPDATES",
-                    pkg_count,
-                    Color32::from_rgb(210, 153, 34),
-                    ActiveTab::Packages,
-                );
-                self.render_metric_card(
-                    ui,
-                    "CVEs",
-                    cve_count,
-                    if cve_count > 0 {
-                        Color32::from_rgb(255, 123, 114)
-                    } else {
-                        Color32::from_rgb(63, 185, 80)
-                    },
-                    ActiveTab::Vulnerabilities,
-                );
-                self.render_metric_card(
-                    ui,
-                    "WMs/DEs",
-                    wm_count,
-                    Color32::from_rgb(121, 192, 255),
-                    ActiveTab::Desktops,
-                );
-                self.render_metric_card(
-                    ui,
-                    "APPIMAGES",
-                    app_count,
-                    Color32::from_rgb(210, 168, 255),
-                    ActiveTab::AppImages,
-                );
-                self.render_metric_card(
-                    ui,
-                    "FLATPAKS",
-                    fp_count,
-                    Color32::from_rgb(63, 185, 80),
-                    ActiveTab::Flatpaks,
-                );
+                if !self.data.session_summary.is_empty() {
+                    ui.label(
+                        RichText::new(&self.data.session_summary)
+                            .color(MUTED)
+                            .small(),
+                    );
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add_enabled(!any_busy, egui::Button::new("📄 Exportar (Ctrl+E)"))
+                        .add_enabled(!any_busy, egui::Button::new("Exportar (Ctrl+E)"))
+                        .on_hover_text("Salva um .md em ~/ e copia para a área de transferência")
                         .clicked()
                     {
-                        self.trigger_export(ui.ctx());
+                        self.trigger_export(&ctx);
                     }
-                    if ui
-                        .add_enabled(!any_busy, egui::Button::new("🛡 CVEs"))
-                        .on_hover_text("Atualizar exclusivamente CVEs (Ctrl+Shift+C)")
-                        .clicked()
-                    {
-                        self.start_cve_refresh(true);
-                    }
-                    if ui
-                        .add_enabled(!any_busy, egui::Button::new("📦 Cache (Ctrl+U)"))
-                        .clicked()
-                    {
-                        self.start_pkg_cache_refresh();
-                    }
-                    if ui
-                        .add_enabled(!any_busy, egui::Button::new("↻ Tudo"))
-                        .clicked()
-                    {
-                        self.start_full_refresh(false);
-                    }
+
+                    ui.add_enabled_ui(!any_busy, |ui| {
+                        ui.menu_button("↻ Atualizar", |ui| {
+                            if ui.button("Tudo (F5)").clicked() {
+                                self.start_full_refresh(false);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Portas").clicked() {
+                                self.start_ports_refresh();
+                                ui.close();
+                            }
+                            if ui.button("Pacotes (Ctrl+U)").clicked() {
+                                self.start_pkgs_refresh();
+                                ui.close();
+                            }
+                            if ui.button("CVEs (Ctrl+Shift+C)").clicked() {
+                                self.start_cve_refresh(true);
+                                ui.close();
+                            }
+                            if ui.button("WMs e ambientes").clicked() {
+                                self.start_desktops_refresh();
+                                ui.close();
+                            }
+                            if ui.button("AppImages").clicked() {
+                                self.start_appimages_refresh();
+                                ui.close();
+                            }
+                            if ui.button("Flatpaks").clicked() {
+                                self.start_flatpaks_refresh();
+                                ui.close();
+                            }
+                        });
+                    });
+
                     if any_busy {
                         ui.spinner();
                     }
@@ -2401,21 +3430,12 @@ impl eframe::App for ArchAuditorApp {
             });
 
             ui.add_space(6.0);
+
+            // Linha 2: cards (que também funcionam como abas) + busca
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Ports, "Portas Abertas");
-                ui.selectable_value(
-                    &mut self.active_tab,
-                    ActiveTab::Packages,
-                    "Pacotes Desatualizados",
-                );
-                ui.selectable_value(
-                    &mut self.active_tab,
-                    ActiveTab::Vulnerabilities,
-                    "Vulnerabilidades (CVEs)",
-                );
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Desktops, "WMs & Ambientes");
-                ui.selectable_value(&mut self.active_tab, ActiveTab::AppImages, "AppImages");
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Flatpaks, "Flatpaks");
+                for tab in ActiveTab::ALL {
+                    self.render_tab_card(ui, tab);
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Limpar (Esc)").clicked() {
@@ -2424,31 +3444,42 @@ impl eframe::App for ArchAuditorApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .id(filter_id)
-                            .hint_text("Buscar na lista (Ctrl+F)...")
-                            .desired_width(220.0),
+                            .hint_text("Buscar nesta aba (Ctrl+F)...")
+                            .desired_width(240.0),
                     );
                 });
             });
             ui.add_space(4.0);
         });
 
+        let updated_txt = if self.data.last_updated_unix == 0 {
+            "—".to_string()
+        } else {
+            format!(
+                "Atualizado {}",
+                fmt_ago(ArchCollectors::now_unix().saturating_sub(self.data.last_updated_unix))
+            )
+        };
+
         egui::Panel::bottom("bottom_status_panel").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if let Some((msg, is_err)) = &self.status_message {
-                    let color = if *is_err {
-                        Color32::from_rgb(255, 123, 114)
-                    } else {
-                        Color32::from_rgb(139, 148, 158)
-                    };
-                    ui.label(RichText::new(msg).color(color));
-                } else {
-                    ui.label(
-                        RichText::new(
-                            "Pronto — Ctrl+F buscar | Ctrl+U cache pacotes | Ctrl+Shift+C CVEs | Ctrl+E exportar",
-                        )
-                        .color(Color32::from_rgb(139, 148, 158)),
-                    );
+                match &self.status {
+                    Some(s) => {
+                        let color = if s.is_error { RED } else { MUTED };
+                        ui.label(RichText::new(&s.text).color(color));
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new(
+                                "Ctrl+F buscar · Ctrl+1…6 abas · F5 atualizar tudo · Ctrl+U pacotes · Ctrl+Shift+C CVEs · Ctrl+E exportar",
+                            )
+                            .color(MUTED),
+                        );
+                    }
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(updated_txt).color(MUTED));
+                });
             });
         });
 
@@ -2460,15 +3491,30 @@ impl eframe::App for ArchAuditorApp {
             ActiveTab::AppImages => self.render_appimages_tab(ui),
             ActiveTab::Flatpaks => self.render_flatpaks_tab(ui),
         });
+
+        self.render_confirm(&ctx);
+
+        // Mantém o "Atualizado há ..." fresco sem consumir CPU.
+        ctx.request_repaint_after(Duration::from_secs(15));
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
+        storage.set_string("tab", self.active_tab.key().to_string());
+        storage.set_string("only_external", b(self.only_external_ports));
+        storage.set_string("only_high", b(self.only_high_cve));
+        storage.set_string("auto_ports", b(self.auto_refresh_ports));
+        storage.set_string("flatpak_user", b(self.flatpak_user_scope));
+        storage.set_string("flatpak_remote", self.flatpak_remote_input.clone());
     }
 }
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1240.0, 740.0])
-            .with_min_inner_size([860.0, 500.0])
-            .with_title("Arch Linux Visual System Auditor (eframe)"),
+            .with_inner_size([1280.0, 760.0])
+            .with_min_inner_size([980.0, 520.0])
+            .with_title("Arch Linux Visual System Auditor"),
         ..Default::default()
     };
 
@@ -2477,4 +3523,76 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(ArchAuditorApp::new(cc)))),
     )
+}
+
+// ───────────────────────────── Testes ─────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_addr_port_cases() {
+        assert_eq!(
+            ArchCollectors::split_addr_port("[::]:22"),
+            ("[::]".to_string(), "22".to_string())
+        );
+        assert_eq!(
+            ArchCollectors::split_addr_port("0.0.0.0:80"),
+            ("0.0.0.0".to_string(), "80".to_string())
+        );
+        assert_eq!(
+            ArchCollectors::split_addr_port("*:631"),
+            ("*".to_string(), "631".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_bind_cases() {
+        assert_eq!(ArchCollectors::classify_bind("0.0.0.0"), Exposure::External);
+        assert_eq!(ArchCollectors::classify_bind("[::]"), Exposure::External);
+        assert_eq!(ArchCollectors::classify_bind("127.0.0.1"), Exposure::Local);
+        assert_eq!(ArchCollectors::classify_bind("[::1]"), Exposure::Local);
+        assert_eq!(
+            ArchCollectors::classify_bind("192.168.0.10"),
+            Exposure::Other
+        );
+    }
+
+    #[test]
+    fn parse_arch_audit_with_fix() {
+        let e = ArchCollectors::parse_arch_audit_line(
+            "Package openssl is affected by CVE-2024-0001, CVE-2024-0002. High risk! Update to 3.0.1-1!",
+        )
+        .expect("deve parsear");
+        assert_eq!(e.package, "openssl");
+        assert_eq!(e.severity, "High");
+        assert_eq!(e.status, "Correção disponível");
+        assert_eq!(e.fixed_ver, "3.0.1-1");
+        assert!(e.cves.contains("CVE-2024-0001"));
+    }
+
+    #[test]
+    fn parse_arch_audit_without_fix() {
+        let e = ArchCollectors::parse_arch_audit_line(
+            "Package linux is affected by CVE-2024-1111. Medium risk!",
+        )
+        .expect("deve parsear");
+        assert_eq!(e.package, "linux");
+        assert_eq!(e.severity, "Medium");
+        assert_eq!(e.status, "Vulnerável");
+        assert_eq!(e.fixed_ver, "Sem correção");
+    }
+
+    #[test]
+    fn decode_proc_addresses() {
+        // 127.0.0.1 aparece como "0100007F" em /proc/net/tcp (little-endian)
+        if cfg!(target_endian = "little") {
+            assert_eq!(ArchCollectors::decode_ipv4("0100007F"), "127.0.0.1");
+        }
+        assert_eq!(
+            ArchCollectors::decode_ipv6("00000000000000000000000000000000"),
+            "[::]"
+        );
+    }
 }
