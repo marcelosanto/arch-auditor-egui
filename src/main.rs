@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, Key, Modifiers, RichText};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // =====================================================================
 // MODELOS DE DADOS
@@ -67,6 +67,15 @@ struct FlatpakEntry {
     installation: String,
 }
 
+#[derive(Debug, Clone)]
+struct CveVulnerabilityEntry {
+    package: String,
+    severity: String, // "High" | "Medium" | "Low" | "Unknown"
+    status: String,   // "Vulnerável" | "Corrigível/Fixado"
+    fixed_ver: String,
+    cves: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct AuditSnapshot {
     ports: Vec<PortEntry>,
@@ -78,12 +87,25 @@ struct AuditSnapshot {
     appimages: Vec<AppImageEntry>,
     flatpaks: Vec<FlatpakEntry>,
     flatpak_note: Option<String>,
+    vulnerabilities: Vec<CveVulnerabilityEntry>,
+    vulnerability_note: Option<String>,
+    last_updated_unix: u64,
+}
+
+enum WorkerEvent {
+    FullSnapshot(AuditSnapshot),
+    PackagesCacheUpdated {
+        packages: Vec<PackageEntry>,
+        package_notes: Vec<String>,
+        updated_unix: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
     Ports,
     Packages,
+    Vulnerabilities,
     Desktops,
     AppImages,
     Flatpaks,
@@ -96,6 +118,13 @@ enum ActiveTab {
 struct ArchCollectors;
 
 impl ArchCollectors {
+    fn now_unix() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     fn command_exists(bin: &str) -> bool {
         env::var_os("PATH")
             .map(|paths| {
@@ -320,6 +349,7 @@ impl ArchCollectors {
                 } else if hex_ip.chars().all(|c| c == '0') {
                     "[::]".to_string()
                 } else {
+                    let _ = Ipv6Addr::from([0; 16]);
                     "[::1]".to_string()
                 };
                 let exposure = Self::classify_bind(&addr);
@@ -406,6 +436,156 @@ impl ArchCollectors {
         }
 
         (pkgs, notes)
+    }
+
+    fn collect_cve_vulnerabilities() -> (Vec<CveVulnerabilityEntry>, Option<String>) {
+        if !Self::command_exists("arch-audit") {
+            return (
+                Vec::new(),
+                Some(
+                    "Utilitário 'arch-audit' não encontrado. Instale com: sudo pacman -S arch-audit"
+                        .to_string(),
+                ),
+            );
+        }
+
+        // Tenta formato customizado estruturado via arch-audit -f
+        // Placeholders oficiais do arch-audit: %n pkgname, %c CVEs, %v fixed version, %s severity
+        match Self::run_with_timeout("arch-audit", &["-c", "-f", "%n\t%s\t%v\t%c"], 25) {
+            Ok(output) => {
+                if !output.status.success() {
+                    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    return (
+                        Vec::new(),
+                        Some(format!(
+                            "Falha ao consultar vulnerabilidades via arch-audit ({})",
+                            if err.is_empty() {
+                                "verifique acesso ao security.archlinux.org"
+                            } else {
+                                &err
+                            }
+                        )),
+                    );
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut entries = Vec::new();
+
+                for line in stdout.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let cols: Vec<&str> = trimmed.split('\t').collect();
+                    if cols.len() >= 2 {
+                        let pkg = cols[0].trim().to_string();
+                        let sev_raw = cols[1].trim();
+                        let severity = if sev_raw.is_empty() {
+                            "Unknown".to_string()
+                        } else {
+                            sev_raw.to_string()
+                        };
+                        let fixed_ver = cols
+                            .get(2)
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty() && *s != "None")
+                            .unwrap_or("Pendente / Sem versão")
+                            .to_string();
+                        let cves = cols
+                            .get(3)
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("CVE não especificado")
+                            .to_string();
+
+                        let status = if fixed_ver.starts_with("Pendente") {
+                            "Vulnerável".to_string()
+                        } else {
+                            "Correção disponível".to_string()
+                        };
+
+                        entries.push(CveVulnerabilityEntry {
+                            package: pkg,
+                            severity,
+                            status,
+                            fixed_ver,
+                            cves,
+                        });
+                    } else if let Some(parsed) = Self::parse_plain_arch_audit_line(trimmed) {
+                        entries.push(parsed);
+                    }
+                }
+
+                entries.sort_by(|a, b| {
+                    let rank = |s: &str| match s.to_lowercase().as_str() {
+                        "high" | "critical" => 0,
+                        "medium" => 1,
+                        "low" => 2,
+                        _ => 3,
+                    };
+                    rank(&a.severity)
+                        .cmp(&rank(&b.severity))
+                        .then(a.package.to_lowercase().cmp(&b.package.to_lowercase()))
+                });
+
+                if entries.is_empty() {
+                    (
+                        Vec::new(),
+                        Some(
+                            "Nenhuma vulnerabilidade CVE reportada para os pacotes instalados."
+                                .to_string(),
+                        ),
+                    )
+                } else {
+                    (entries, None)
+                }
+            }
+            Err(err) => (Vec::new(), Some(err)),
+        }
+    }
+
+    fn parse_plain_arch_audit_line(line: &str) -> Option<CveVulnerabilityEntry> {
+        // Fallback para linhas textuais padrão do arch-audit
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.is_empty() {
+            return None;
+        }
+        let pkg = tokens[0].to_string();
+        let cves: Vec<String> = tokens
+            .iter()
+            .filter_map(|t| {
+                let clean = t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+                if clean.starts_with("CVE-") {
+                    Some(clean.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let lower = line.to_lowercase();
+        let severity = if lower.contains("high") {
+            "High"
+        } else if lower.contains("medium") {
+            "Medium"
+        } else if lower.contains("low") {
+            "Low"
+        } else {
+            "Unknown"
+        }
+        .to_string();
+
+        Some(CveVulnerabilityEntry {
+            package: pkg,
+            severity,
+            status: "Reportado".to_string(),
+            fixed_ver: "-".to_string(),
+            cves: if cves.is_empty() {
+                line.to_string()
+            } else {
+                cves.join(", ")
+            },
+        })
     }
 
     fn collect_wms_and_des() -> (Vec<DesktopEntryItem>, String) {
@@ -704,6 +884,7 @@ impl ArchCollectors {
         let appimages = Self::collect_appimages();
         let (flatpaks, flatpak_note) = Self::collect_flatpaks();
         let (packages, package_notes) = Self::collect_outdated_packages();
+        let (vulnerabilities, vulnerability_note) = Self::collect_cve_vulnerabilities();
 
         AuditSnapshot {
             ports,
@@ -715,7 +896,145 @@ impl ArchCollectors {
             appimages,
             flatpaks,
             flatpak_note,
+            vulnerabilities,
+            vulnerability_note,
+            last_updated_unix: Self::now_unix(),
         }
+    }
+
+    fn build_summary_markdown(snap: &AuditSnapshot, ts: u64) -> String {
+        let mut md = String::new();
+        md.push_str("# Resumo de Auditoria — Arch Linux\n\n");
+        md.push_str(&format!("- **Timestamp (UNIX):** `{}`\n", ts));
+        if !snap.session_summary.is_empty() {
+            md.push_str(&format!("- **Sessão:** {}\n", snap.session_summary));
+        }
+
+        let external_ports: Vec<&PortEntry> = snap
+            .ports
+            .iter()
+            .filter(|p| p.exposure == Exposure::External)
+            .collect();
+
+        md.push_str(&format!(
+            "- **Portas Abertas:** {} total | **{} externas (`0.0.0.0` / `[::]`)**\n",
+            snap.ports.len(),
+            external_ports.len()
+        ));
+        md.push_str(&format!(
+            "- **Pacotes Desatualizados:** {}\n",
+            snap.packages.len()
+        ));
+        md.push_str(&format!(
+            "- **Vulnerabilidades (CVEs):** {}\n",
+            snap.vulnerabilities.len()
+        ));
+        md.push_str(&format!(
+            "- **WMs / Ambientes Detectados:** {}\n",
+            snap.desktops.len()
+        ));
+        md.push_str(&format!("- **AppImages:** {}\n", snap.appimages.len()));
+        md.push_str(&format!("- **Flatpaks:** {}\n\n", snap.flatpaks.len()));
+
+        md.push_str("## 1. Portas Externas em Escuta (0.0.0.0 / [::])\n\n");
+        if external_ports.is_empty() {
+            md.push_str("Nenhuma porta em `0.0.0.0` ou `[::]` detectada.\n\n");
+        } else {
+            md.push_str("| Proto | Endereço | Porta | Processo | PID | Estado |\n");
+            md.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+            for p in external_ports {
+                md.push_str(&format!(
+                    "| {} | `{}` | `{}` | {} | {} | {} |\n",
+                    p.protocol, p.local_addr, p.port, p.process, p.pid, p.state
+                ));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## 2. Pacotes Desatualizados\n\n");
+        if snap.packages.is_empty() {
+            md.push_str("Nenhum pacote desatualizado listado.\n\n");
+        } else {
+            md.push_str("| Origem | Pacote | Versão Atual | Nova Versão |\n");
+            md.push_str("| :--- | :--- | :--- | :--- |\n");
+            for pkg in &snap.packages {
+                md.push_str(&format!(
+                    "| {} | `{}` | `{}` | `{}` |\n",
+                    pkg.source, pkg.name, pkg.current_ver, pkg.new_ver
+                ));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## 3. Vulnerabilidades Conhecidas (CVEs)\n\n");
+        if snap.vulnerabilities.is_empty() {
+            md.push_str(
+                snap.vulnerability_note
+                    .as_deref()
+                    .unwrap_or("Nenhuma vulnerabilidade CVE listada.\n"),
+            );
+            md.push_str("\n\n");
+        } else {
+            md.push_str("| Pacote | Severidade | Status | Correção | CVEs |\n");
+            md.push_str("| :--- | :--- | :--- | :--- | :--- |\n");
+            for v in &snap.vulnerabilities {
+                md.push_str(&format!(
+                    "| `{}` | {} | {} | `{}` | {} |\n",
+                    v.package, v.severity, v.status, v.fixed_ver, v.cves
+                ));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## 4. WMs e Ambientes Gráficos\n\n");
+        for d in &snap.desktops {
+            let tag = if d.active { " (ATIVA)" } else { "" };
+            md.push_str(&format!(
+                "- **{}**{} — {} (`{}`)\n",
+                d.name, tag, d.session_type, d.binary
+            ));
+        }
+        md.push('\n');
+
+        md.push_str("## 5. AppImages\n\n");
+        if snap.appimages.is_empty() {
+            md.push_str("Nenhum `.AppImage` encontrado nos diretórios padrão.\n\n");
+        } else {
+            for app in &snap.appimages {
+                let perm = if app.executable { "+x" } else { "sem +x" };
+                md.push_str(&format!(
+                    "- `{}` ({}, {}) — `{}`\n",
+                    app.name, app.size_human, perm, app.path
+                ));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## 6. Flatpaks\n\n");
+        if snap.flatpaks.is_empty() {
+            md.push_str("Nenhum Flatpak instalado ou `flatpak` indisponível.\n");
+        } else {
+            for fp in &snap.flatpaks {
+                md.push_str(&format!(
+                    "- **{}** (`{}`) — v{} [{} / {}]\n",
+                    fp.name, fp.app_id, fp.version, fp.origin, fp.installation
+                ));
+            }
+        }
+
+        md
+    }
+
+    fn export_summary(snap: &AuditSnapshot) -> Result<PathBuf, String> {
+        let ts = Self::now_unix();
+        let base_dir = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let out_path = base_dir.join(format!("arch-audit-resumo-{}.md", ts));
+        let content = Self::build_summary_markdown(snap, ts);
+        fs::write(&out_path, content)
+            .map_err(|e| format!("Falha ao salvar resumo em '{}': {}", out_path.display(), e))?;
+        Ok(out_path)
     }
 }
 
@@ -735,8 +1054,11 @@ struct ArchAuditorApp {
     active_tab: ActiveTab,
     filter: String,
     only_external_ports: bool,
-    loading: bool,
-    rx: Option<Receiver<AuditSnapshot>>,
+    only_high_cve: bool,
+    loading_full: bool,
+    loading_pkg_cache: bool,
+    status_message: Option<(String, bool)>,
+    rx: Option<Receiver<WorkerEvent>>,
 }
 
 impl ArchAuditorApp {
@@ -751,34 +1073,135 @@ impl ArchAuditorApp {
             active_tab: ActiveTab::Ports,
             filter: String::new(),
             only_external_ports: false,
-            loading: false,
+            only_high_cve: false,
+            loading_full: false,
+            loading_pkg_cache: false,
+            status_message: None,
             rx: None,
         };
-        app.start_refresh();
+        app.start_full_refresh();
         app
     }
 
-    fn start_refresh(&mut self) {
+    fn ensure_channel(&mut self) -> mpsc::Sender<WorkerEvent> {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
-        self.loading = true;
+        tx
+    }
+
+    fn start_full_refresh(&mut self) {
+        let tx = self.ensure_channel();
+        self.loading_full = true;
+        self.status_message = Some((
+            "Executando auditoria completa do sistema...".to_string(),
+            false,
+        ));
 
         thread::spawn(move || {
             let snap = ArchCollectors::collect_all();
-            let _ = tx.send(snap);
+            let _ = tx.send(WorkerEvent::FullSnapshot(snap));
         });
+    }
+
+    fn start_pkg_cache_refresh(&mut self) {
+        if self.loading_pkg_cache {
+            return;
+        }
+        let tx = self.ensure_channel();
+        self.loading_pkg_cache = true;
+        self.status_message = Some((
+            "Atualizando cache de pacotes desatualizados (checkupdates / AUR)...".to_string(),
+            false,
+        ));
+
+        thread::spawn(move || {
+            let (packages, package_notes) = ArchCollectors::collect_outdated_packages();
+            let _ = tx.send(WorkerEvent::PackagesCacheUpdated {
+                packages,
+                package_notes,
+                updated_unix: ArchCollectors::now_unix(),
+            });
+        });
+    }
+
+    fn trigger_export(&mut self, ctx: &egui::Context) {
+        let ts = ArchCollectors::now_unix();
+        let md = ArchCollectors::build_summary_markdown(&self.data, ts);
+        ctx.copy_text(md);
+
+        match ArchCollectors::export_summary(&self.data) {
+            Ok(path) => {
+                self.status_message = Some((
+                    format!(
+                        "Resumo salvo em {} e copiado para a área de transferência.",
+                        path.display()
+                    ),
+                    false,
+                ));
+            }
+            Err(err) => {
+                self.status_message = Some((err, true));
+            }
+        }
     }
 
     fn poll_worker(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.rx {
-            if let Ok(snap) = rx.try_recv() {
-                self.data = snap;
-                self.loading = false;
-                self.rx = None;
-            } else if self.loading {
-                ctx.request_repaint_after(Duration::from_millis(120));
+            match rx.try_recv() {
+                Ok(WorkerEvent::FullSnapshot(snap)) => {
+                    self.data = snap;
+                    self.loading_full = false;
+                    self.loading_pkg_cache = false;
+                    self.rx = None;
+                    self.status_message = Some(("Auditoria concluída.".to_string(), false));
+                }
+                Ok(WorkerEvent::PackagesCacheUpdated {
+                    packages,
+                    package_notes,
+                    updated_unix,
+                }) => {
+                    self.data.packages = packages;
+                    self.data.package_notes = package_notes;
+                    self.data.last_updated_unix = updated_unix;
+                    self.loading_pkg_cache = false;
+                    self.rx = None;
+                    self.status_message = Some((
+                        format!(
+                            "Cache de pacotes atualizado ({} pendente(s)).",
+                            self.data.packages.len()
+                        ),
+                        false,
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if self.loading_full || self.loading_pkg_cache {
+                        ctx.request_repaint_after(Duration::from_millis(120));
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.loading_full = false;
+                    self.loading_pkg_cache = false;
+                    self.rx = None;
+                }
             }
         }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context, filter_id: egui::Id) {
+        ctx.input(|i| {
+            if i.modifiers.contains(Modifiers::CTRL) && i.key_pressed(Key::F) {
+                ctx.memory_mut(|m| m.request_focus(filter_id));
+            }
+            if i.modifiers.contains(Modifiers::CTRL) && i.key_pressed(Key::U) {
+                self.start_pkg_cache_refresh();
+            }
+            if i.modifiers.contains(Modifiers::CTRL) && i.key_pressed(Key::E) {
+                self.trigger_export(ctx);
+            }
+            if i.key_pressed(Key::Escape) {
+                self.filter.clear();
+            }
+        });
     }
 
     fn matches_filter(&self, haystack: &str) -> bool {
@@ -869,13 +1292,29 @@ impl ArchAuditorApp {
         });
     }
 
-    fn render_packages_tab(&self, ui: &mut egui::Ui) {
+    fn render_packages_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.loading_pkg_cache && !self.loading_full,
+                    egui::Button::new("📦 Atualizar Cache de Pacotes (Ctrl+U)"),
+                )
+                .clicked()
+            {
+                self.start_pkg_cache_refresh();
+            }
+            if self.loading_pkg_cache {
+                ui.spinner();
+                ui.label("Consultando checkupdates / AUR...");
+            }
+        });
+
+        ui.add_space(4.0);
+
         if self.data.packages.is_empty() {
             ui.label(
-                RichText::new(
-                    "Nenhum pacote desatualizado encontrado ou verificação ainda sem pendências.",
-                )
-                .color(Color32::from_rgb(63, 185, 80)),
+                RichText::new("Nenhum pacote desatualizado encontrado ou lista vazia.")
+                    .color(Color32::from_rgb(63, 185, 80)),
             );
         } else {
             ui.label(
@@ -926,6 +1365,61 @@ impl ArchAuditorApp {
                                 .strong()
                                 .monospace(),
                         );
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn render_vulnerabilities_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut self.only_high_cve,
+                RichText::new("Mostrar apenas severidade High / Critical").strong(),
+            );
+        });
+
+        if let Some(note) = &self.data.vulnerability_note {
+            ui.colored_label(Color32::from_rgb(210, 153, 34), format!("ℹ {}", note));
+        }
+
+        ui.add_space(6.0);
+
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("cves_grid")
+                .striped(true)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
+                    for h in ["Severidade", "Pacote", "Status", "Correção", "CVEs"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+
+                    for v in &self.data.vulnerabilities {
+                        let sev_low = v.severity.to_lowercase();
+                        if self.only_high_cve && !(sev_low == "high" || sev_low == "critical") {
+                            continue;
+                        }
+                        let blob = format!(
+                            "{} {} {} {} {}",
+                            v.package, v.severity, v.status, v.fixed_ver, v.cves
+                        );
+                        if !self.matches_filter(&blob) {
+                            continue;
+                        }
+
+                        let sev_color = match sev_low.as_str() {
+                            "high" | "critical" => Color32::from_rgb(255, 123, 114),
+                            "medium" => Color32::from_rgb(210, 153, 34),
+                            "low" => Color32::from_rgb(121, 192, 255),
+                            _ => Color32::from_rgb(139, 148, 158),
+                        };
+
+                        ui.label(RichText::new(&v.severity).color(sev_color).strong());
+                        ui.label(RichText::new(&v.package).strong().monospace());
+                        ui.label(&v.status);
+                        ui.label(RichText::new(&v.fixed_ver).monospace());
+                        ui.label(RichText::new(&v.cves).color(sev_color).monospace());
                         ui.end_row();
                     }
                 });
@@ -986,8 +1480,10 @@ impl ArchAuditorApp {
 
     fn render_appimages_tab(&self, ui: &mut egui::Ui) {
         ui.label(
-            RichText::new("Diretórios verificados: ~/Applications, ~/Downloads, ~/Desktop, ~/.local/bin e /opt")
-                .color(Color32::from_rgb(139, 148, 158)),
+            RichText::new(
+                "Diretórios verificados: ~/Applications, ~/Downloads, ~/Desktop, ~/.local/bin e /opt",
+            )
+            .color(Color32::from_rgb(139, 148, 158)),
         );
         ui.add_space(6.0);
 
@@ -1084,6 +1580,8 @@ impl ArchAuditorApp {
 impl eframe::App for ArchAuditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_worker(ui.ctx());
+        let filter_id = egui::Id::unique("search_filter_input");
+        self.handle_shortcuts(ui, filter_id);
 
         let external_count = self
             .data
@@ -1091,6 +1589,8 @@ impl eframe::App for ArchAuditorApp {
             .iter()
             .filter(|p| p.exposure == Exposure::External)
             .count();
+        let cve_count = self.data.vulnerabilities.len();
+        let any_busy = self.loading_full || self.loading_pkg_cache;
 
         egui::Panel::top("top_panel").show(ui, |ui| {
             ui.add_space(4.0);
@@ -1116,6 +1616,18 @@ impl eframe::App for ArchAuditorApp {
                 ui.separator();
                 ui.label(format!("Updates: {}", self.data.packages.len()));
                 ui.separator();
+
+                let cve_color = if cve_count > 0 {
+                    Color32::from_rgb(255, 123, 114)
+                } else {
+                    Color32::from_rgb(63, 185, 80)
+                };
+                ui.label(
+                    RichText::new(format!("CVEs: {}", cve_count))
+                        .color(cve_color)
+                        .strong(),
+                );
+                ui.separator();
                 ui.label(format!("WMs/DEs: {}", self.data.desktops.len()));
                 ui.separator();
                 ui.label(format!("AppImages: {}", self.data.appimages.len()));
@@ -1124,14 +1636,25 @@ impl eframe::App for ArchAuditorApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add_enabled(!self.loading, egui::Button::new("↻ Atualizar"))
+                        .add_enabled(!any_busy, egui::Button::new("📄 Exportar Resumo (Ctrl+E)"))
                         .clicked()
                     {
-                        self.start_refresh();
+                        self.trigger_export(ui);
                     }
-                    if self.loading {
+                    if ui
+                        .add_enabled(!any_busy, egui::Button::new("📦 Cache Pacotes (Ctrl+U)"))
+                        .clicked()
+                    {
+                        self.start_pkg_cache_refresh();
+                    }
+                    if ui
+                        .add_enabled(!any_busy, egui::Button::new("↻ Atualizar Tudo"))
+                        .clicked()
+                    {
+                        self.start_full_refresh();
+                    }
+                    if any_busy {
                         ui.spinner();
-                        ui.label("Coletando...");
                     }
                 });
             });
@@ -1144,27 +1667,54 @@ impl eframe::App for ArchAuditorApp {
                     ActiveTab::Packages,
                     "Pacotes Desatualizados",
                 );
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    ActiveTab::Vulnerabilities,
+                    "Vulnerabilidades (CVEs)",
+                );
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Desktops, "WMs & Ambientes");
                 ui.selectable_value(&mut self.active_tab, ActiveTab::AppImages, "AppImages");
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Flatpaks, "Flatpaks");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Limpar").clicked() {
+                    if ui.small_button("Limpar (Esc)").clicked() {
                         self.filter.clear();
                     }
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("Filtrar na aba atual...")
-                            .desired_width(240.0),
+                            .id(filter_id)
+                            .hint_text("Buscar na lista (Ctrl+F)...")
+                            .desired_width(230.0),
                     );
                 });
             });
             ui.add_space(4.0);
         });
 
+        egui::Panel::bottom("bottom_status_panel").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some((msg, is_err)) = &self.status_message {
+                    let color = if *is_err {
+                        Color32::from_rgb(255, 123, 114)
+                    } else {
+                        Color32::from_rgb(139, 148, 158)
+                    };
+                    ui.label(RichText::new(msg).color(color));
+                } else {
+                    ui.label(
+                        RichText::new(
+                            "Pronto — Ctrl+F buscar | Ctrl+U cache pacotes | Ctrl+E exportar",
+                        )
+                        .color(Color32::from_rgb(139, 148, 158)),
+                    );
+                }
+            });
+        });
+
         egui::CentralPanel::default().show(ui, |ui| match self.active_tab {
             ActiveTab::Ports => self.render_ports_tab(ui),
             ActiveTab::Packages => self.render_packages_tab(ui),
+            ActiveTab::Vulnerabilities => self.render_vulnerabilities_tab(ui),
             ActiveTab::Desktops => self.render_desktops_tab(ui),
             ActiveTab::AppImages => self.render_appimages_tab(ui),
             ActiveTab::Flatpaks => self.render_flatpaks_tab(ui),
@@ -1175,8 +1725,8 @@ impl eframe::App for ArchAuditorApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1060.0, 680.0])
-            .with_min_inner_size([720.0, 440.0])
+            .with_inner_size([1180.0, 720.0])
+            .with_min_inner_size([820.0, 480.0])
             .with_title("Arch Linux Visual System Auditor (eframe)"),
         ..Default::default()
     };
