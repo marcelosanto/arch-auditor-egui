@@ -376,6 +376,14 @@ struct Status {
 #[derive(Clone)]
 enum Confirm {
     AppImage(String),
+    DeleteAppImage {
+        path: String,
+    },
+    UninstallFlatpak {
+        app_id: String,
+        name: String,
+        installation: String,
+    },
     Flatpak {
         app_id: String,
         remote: String,
@@ -1599,6 +1607,97 @@ impl ArchCollectors {
         }
     }
 
+    // ── Executar / remover apps ──
+
+    /// Inicia um processo desacoplado (não morre ao fechar o auditor).
+    fn spawn_detached(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+        let mut c = Command::new(cmd);
+        c.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        if let Some(d) = cwd {
+            c.current_dir(d);
+        }
+        let mut child = c
+            .spawn()
+            .map_err(|e| format!("Falha ao iniciar '{}': {}", cmd, e))?;
+        thread::spawn(move || {
+            let _ = child.wait(); // evita processo zumbi
+        });
+        Ok(())
+    }
+
+    fn run_flatpak_app(app_id: &str) -> Result<String, String> {
+        if !valid_flatpak_token(app_id) {
+            return Err("Application ID inválido.".to_string());
+        }
+        if !Self::command_exists("flatpak") {
+            return Err("Comando 'flatpak' não encontrado.".to_string());
+        }
+        Self::spawn_detached("flatpak", &["run", app_id], None)?;
+        Ok(format!("Iniciando Flatpak '{}'...", app_id))
+    }
+
+    fn run_appimage(path: &str) -> Result<String, String> {
+        let p = Path::new(path);
+        if !p.is_file() {
+            return Err(format!("Arquivo não encontrado: {}", path));
+        }
+        if !Self::is_executable(p) {
+            return Err("O AppImage está sem +x. Use 'Habilitar +x' primeiro.".to_string());
+        }
+        Self::spawn_detached(path, &[], p.parent())?;
+        Ok(format!("Iniciando {}...", path))
+    }
+
+    fn uninstall_flatpak_app(app_id: &str, installation: &str) -> Result<String, String> {
+        if !valid_flatpak_token(app_id) {
+            return Err("Application ID inválido.".to_string());
+        }
+        let scope = match installation.trim() {
+            "user" => "--user".to_string(),
+            "system" => "--system".to_string(),
+            other if valid_flatpak_token(other) => format!("--installation={}", other),
+            _ => return Err("Escopo de instalação desconhecido.".to_string()),
+        };
+        if !Self::command_exists("flatpak") {
+            return Err("Comando 'flatpak' não encontrado.".to_string());
+        }
+        let output =
+            Self::run_with_timeout("flatpak", &["uninstall", scope.as_str(), "-y", app_id], 120)?;
+        if output.status.success() {
+            Ok(format!("Flatpak '{}' desinstalado.", app_id))
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(format!("Falha ao desinstalar '{}': {}", app_id, err))
+        }
+    }
+
+    fn delete_appimage(path: &str) -> Result<String, String> {
+        let p = Path::new(path);
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !name.to_lowercase().ends_with(".appimage") {
+            return Err("Só é possível excluir arquivos .AppImage.".to_string());
+        }
+        let meta =
+            fs::symlink_metadata(p).map_err(|e| format!("Falha ao ler '{}': {}", path, e))?;
+        if !meta.is_file() {
+            return Err("O alvo não é um arquivo regular.".to_string());
+        }
+        if Self::command_exists("gio") {
+            if let Ok(out) = Self::run_with_timeout("gio", &["trash", path], 15) {
+                if out.status.success() {
+                    return Ok(format!("'{}' movido para a lixeira.", name));
+                }
+            }
+        }
+        fs::remove_file(p).map_err(|e| format!("Falha ao excluir '{}': {}", path, e))?;
+        Ok(format!("'{}' removido permanentemente.", name))
+    }
+
     // ── Exportação ──
 
     fn build_summary_markdown(snap: &AuditSnapshot, ts: u64) -> String {
@@ -2128,6 +2227,61 @@ impl ArchAuditorApp {
         let em = self.emitter.clone();
         thread::spawn(move || {
             match ArchCollectors::install_flatpak_app(&app_id, &remote, user_scope) {
+                Ok(message) => {
+                    em.send(WorkerEvent::ActionDone {
+                        message,
+                        is_error: false,
+                    });
+                    let (flatpaks, note) = ArchCollectors::collect_flatpaks();
+                    em.send(WorkerEvent::Flatpaks { flatpaks, note });
+                }
+                Err(message) => em.send(WorkerEvent::ActionDone {
+                    message,
+                    is_error: true,
+                }),
+            }
+        });
+    }
+
+    fn run_appimage_now(&mut self, path: &str) {
+        match ArchCollectors::run_appimage(path) {
+            Ok(m) => self.set_status(m, false),
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    fn run_flatpak_now(&mut self, app_id: &str) {
+        match ArchCollectors::run_flatpak_app(app_id) {
+            Ok(m) => self.set_status(m, false),
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    fn start_delete_appimage(&mut self, path: String) {
+        self.loading_action = true;
+        self.set_status("Removendo AppImage...", false);
+        let em = self.emitter.clone();
+        thread::spawn(move || match ArchCollectors::delete_appimage(&path) {
+            Ok(message) => {
+                em.send(WorkerEvent::ActionDone {
+                    message,
+                    is_error: false,
+                });
+                em.send(WorkerEvent::AppImages(ArchCollectors::collect_appimages()));
+            }
+            Err(message) => em.send(WorkerEvent::ActionDone {
+                message,
+                is_error: true,
+            }),
+        });
+    }
+
+    fn start_uninstall_flatpak(&mut self, app_id: String, installation: String) {
+        self.loading_action = true;
+        self.set_status(format!("Desinstalando Flatpak '{}'...", app_id), false);
+        let em = self.emitter.clone();
+        thread::spawn(move || {
+            match ArchCollectors::uninstall_flatpak_app(&app_id, &installation) {
                 Ok(message) => {
                     em.send(WorkerEvent::ActionDone {
                         message,
@@ -3033,6 +3187,8 @@ impl ArchAuditorApp {
         ui.add_space(4.0);
 
         let mut chmod_target: Option<String> = None;
+        let mut run_target: Option<String> = None;
+        let mut delete_target: Option<String> = None;
 
         if self.data.appimages.is_empty() {
             empty_state(
@@ -3090,15 +3246,27 @@ impl ArchAuditorApp {
                                 ui.label(RichText::new(&app.path).monospace());
                             });
                             row.col(|ui| {
-                                if !app.executable {
-                                    if ui.small_button("Habilitar +x").clicked() {
-                                        chmod_target = Some(app.path.clone());
+                                if app.executable {
+                                    if ui.small_button("Executar").clicked() {
+                                        run_target = Some(app.path.clone());
                                     }
-                                } else {
-                                    ui.label(RichText::new("Pronto").color(MUTED));
+                                } else if ui.small_button("Habilitar +x").clicked() {
+                                    chmod_target = Some(app.path.clone());
+                                }
+                                if ui.small_button("Excluir").clicked() {
+                                    delete_target = Some(app.path.clone());
                                 }
                             });
                             row.response().context_menu(|ui| {
+                                if app.executable && ui.button("Executar").clicked() {
+                                    run_target = Some(app.path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Excluir...").clicked() {
+                                    delete_target = Some(app.path.clone());
+                                    ui.close();
+                                }
+                                ui.separator();
                                 if ui.button("Copiar caminho").clicked() {
                                     ui.ctx().copy_text(app.path.clone());
                                     ui.close();
@@ -3113,8 +3281,14 @@ impl ArchAuditorApp {
             });
         }
 
+        if let Some(p) = run_target {
+            self.run_appimage_now(&p);
+        }
         if let Some(p) = chmod_target {
             self.start_chmod_appimage(p);
+        }
+        if let Some(p) = delete_target {
+            self.confirm = Some(Confirm::DeleteAppImage { path: p });
         }
     }
 
@@ -3214,6 +3388,9 @@ impl ArchAuditorApp {
             return;
         }
 
+        let mut run_flatpak: Option<String> = None;
+        let mut uninstall_flatpak: Option<(String, String, String)> = None; // (id, nome, escopo)
+
         ui.push_id("flatpaks_table", |ui| {
             TableBuilder::new(ui)
                 .striped(true)
@@ -3225,6 +3402,7 @@ impl ArchAuditorApp {
                 .column(Column::auto().at_least(90.0))
                 .column(Column::auto().at_least(80.0))
                 .column(Column::auto().at_least(100.0))
+                .column(Column::auto().at_least(80.0))
                 .column(Column::remainder())
                 .header(26.0, |mut header| {
                     for t in [
@@ -3234,6 +3412,7 @@ impl ArchAuditorApp {
                         "Branch",
                         "Repositório",
                         "Escopo",
+                        "Ações",
                     ] {
                         header.col(|ui| {
                             ui.strong(t);
@@ -3261,7 +3440,32 @@ impl ArchAuditorApp {
                         row.col(|ui| {
                             ui.label(&fp.installation);
                         });
+                        row.col(|ui| {
+                            if ui.small_button("Executar").clicked() {
+                                run_flatpak = Some(fp.app_id.clone());
+                            }
+                            if ui.small_button("Desinstalar").clicked() {
+                                uninstall_flatpak = Some((
+                                    fp.app_id.clone(),
+                                    fp.name.clone(),
+                                    fp.installation.clone(),
+                                ));
+                            }
+                        });
                         row.response().context_menu(|ui| {
+                            if ui.button("Executar").clicked() {
+                                run_flatpak = Some(fp.app_id.clone());
+                                ui.close();
+                            }
+                            if ui.button("Desinstalar...").clicked() {
+                                uninstall_flatpak = Some((
+                                    fp.app_id.clone(),
+                                    fp.name.clone(),
+                                    fp.installation.clone(),
+                                ));
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui.button("Copiar Application ID").clicked() {
                                 ui.ctx().copy_text(fp.app_id.clone());
                                 ui.close();
@@ -3274,6 +3478,17 @@ impl ArchAuditorApp {
                     });
                 });
         });
+
+        if let Some(id) = run_flatpak {
+            self.run_flatpak_now(&id);
+        }
+        if let Some((app_id, name, installation)) = uninstall_flatpak {
+            self.confirm = Some(Confirm::UninstallFlatpak {
+                app_id,
+                name,
+                installation,
+            });
+        }
     }
 
     // ── Diálogo de confirmação ──
@@ -3309,6 +3524,24 @@ impl ArchAuditorApp {
                     }
                 ),
             ),
+            Confirm::DeleteAppImage { path } => (
+                "Excluir AppImage",
+                format!(
+                    "Excluir este arquivo? Ele vai para a lixeira se o 'gio' estiver disponível; caso contrário será apagado de vez.\n\n{}",
+                    path
+                ),
+            ),
+            Confirm::UninstallFlatpak {
+                app_id,
+                name,
+                installation,
+            } => (
+                "Desinstalar Flatpak",
+                format!(
+                    "Desinstalar '{}' ({}) do escopo '{}'?\n\nOs dados do usuário em ~/.var/app são mantidos.",
+                    name, app_id, installation
+                ),
+            ),
         };
 
         let mut decision: Option<bool> = None;
@@ -3340,6 +3573,12 @@ impl ArchAuditorApp {
                         remote,
                         user_scope,
                     } => self.start_install_flatpak(app_id, remote, user_scope),
+                    Confirm::DeleteAppImage { path } => self.start_delete_appimage(path),
+                    Confirm::UninstallFlatpak {
+                        app_id,
+                        installation,
+                        ..
+                    } => self.start_uninstall_flatpak(app_id, installation),
                 }
             }
             Some(false) => self.confirm = None,
@@ -3351,7 +3590,7 @@ impl ArchAuditorApp {
 impl eframe::App for ArchAuditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let filter_id = egui::Id::unique("search_filter_input");
+        let filter_id = egui::Id::new("search_filter_input");
 
         self.poll_worker();
         self.handle_dropped_files(&ctx);
