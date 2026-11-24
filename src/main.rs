@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CVE_CACHE_TTL_SECS: u64 = 600;
 const PORTS_AUTO_REFRESH: Duration = Duration::from_secs(5);
+const JOURNAL_LIMIT: usize = 1500;
 
 const BG: Color32 = Color32::from_rgb(15, 20, 25);
 const CARD: Color32 = Color32::from_rgb(22, 27, 34);
@@ -255,6 +256,74 @@ struct CveResult {
     from_cache: bool,
 }
 
+#[derive(Debug, Clone)]
+struct JournalEntry {
+    time: String,
+    priority: u8,
+    unit: String,
+    message: String,
+    search: String,
+}
+
+impl JournalEntry {
+    fn new(time: String, priority: u8, unit: String, message: String) -> Self {
+        let search = make_search(&[unit.as_str(), message.as_str(), prio_name(priority)]);
+        Self {
+            time,
+            priority,
+            unit,
+            message,
+            search,
+        }
+    }
+}
+
+/// Informações do UFW que dispensam privilégios (systemctl + arquivos legíveis em /etc).
+#[derive(Debug, Clone, Default)]
+struct FirewallBasic {
+    installed: bool,
+    service_active: String,
+    service_enabled: String,
+    conf_enabled: Option<bool>,
+    log_level: Option<String>,
+    default_in: Option<String>,
+    default_out: Option<String>,
+    default_routed: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UfwRule {
+    to: String,
+    action: String,
+    from: String,
+    v6: bool,
+    search: String,
+}
+
+impl UfwRule {
+    fn new(to: String, action: String, from: String, v6: bool) -> Self {
+        let search = make_search(&[to.as_str(), action.as_str(), from.as_str()]);
+        Self {
+            to,
+            action,
+            from,
+            v6,
+            search,
+        }
+    }
+}
+
+/// Resultado de `ufw status verbose` (exige root).
+#[derive(Debug, Clone, Default)]
+struct UfwStatus {
+    active: bool,
+    logging: String,
+    default_in: String,
+    default_out: String,
+    default_routed: String,
+    rules: Vec<UfwRule>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct AuditSnapshot {
     ports: Vec<PortEntry>,
@@ -268,6 +337,12 @@ struct AuditSnapshot {
     flatpak_note: Option<String>,
     vulnerabilities: Vec<CveVulnerabilityEntry>,
     vulnerability_note: Option<String>,
+    journal: Vec<JournalEntry>,
+    journal_note: Option<String>,
+    firewall: FirewallBasic,
+    ufw: Option<UfwStatus>,
+    ufw_note: Option<String>,
+    ufw_read_at: u64,
     last_updated_unix: u64,
 }
 
@@ -294,6 +369,12 @@ enum WorkerEvent {
         flatpaks: Vec<FlatpakEntry>,
         note: Option<String>,
     },
+    Journal {
+        entries: Vec<JournalEntry>,
+        note: Option<String>,
+    },
+    FirewallBasic(FirewallBasic),
+    UfwRules(Result<UfwStatus, String>),
     ActionDone {
         message: String,
         is_error: bool,
@@ -322,16 +403,20 @@ enum ActiveTab {
     Desktops,
     AppImages,
     Flatpaks,
+    Journal,
+    Firewall,
 }
 
 impl ActiveTab {
-    const ALL: [ActiveTab; 6] = [
+    const ALL: [ActiveTab; 8] = [
         ActiveTab::Ports,
         ActiveTab::Packages,
         ActiveTab::Vulnerabilities,
         ActiveTab::Desktops,
         ActiveTab::AppImages,
         ActiveTab::Flatpaks,
+        ActiveTab::Journal,
+        ActiveTab::Firewall,
     ];
 
     fn key(self) -> &'static str {
@@ -342,6 +427,8 @@ impl ActiveTab {
             ActiveTab::Desktops => "desktops",
             ActiveTab::AppImages => "appimages",
             ActiveTab::Flatpaks => "flatpaks",
+            ActiveTab::Journal => "journal",
+            ActiveTab::Firewall => "firewall",
         }
     }
 
@@ -357,6 +444,8 @@ impl ActiveTab {
             ActiveTab::Desktops => "WMs e ambientes",
             ActiveTab::AppImages => "AppImages",
             ActiveTab::Flatpaks => "Flatpaks",
+            ActiveTab::Journal => "Journal do sistema",
+            ActiveTab::Firewall => "Firewall (UFW)",
         }
     }
 }
@@ -442,6 +531,278 @@ fn valid_flatpak_token(s: &str) -> bool {
 }
 
 // ───────────────────────────── Coletores ─────────────────────────────
+
+// ───────────────────────────── Journal / UFW (helpers) ─────────────────────────────
+
+fn prio_name(p: u8) -> &'static str {
+    match p {
+        0 => "EMERG",
+        1 => "ALERT",
+        2 => "CRIT",
+        3 => "ERR",
+        4 => "WARN",
+        5 => "NOTICE",
+        6 => "INFO",
+        7 => "DEBUG",
+        _ => "?",
+    }
+}
+
+fn prio_label(p: u8) -> &'static str {
+    match p {
+        3 => "Erro ou pior",
+        4 => "Aviso ou pior",
+        5 => "Notice ou pior",
+        6 => "Info ou pior",
+        _ => "Todas",
+    }
+}
+
+fn prio_color(p: u8) -> Color32 {
+    match p {
+        0..=3 => RED,
+        4 => ORANGE,
+        5 => BLUE,
+        _ => MUTED,
+    }
+}
+
+fn valid_unit_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | ':' | '\\'))
+}
+
+/// Converte segundos UNIX em "AAAA-MM-DD HH:MM:SS" (algoritmo civil-from-days).
+fn fmt_datetime(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let secs = unix_secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// Separa colunas alinhadas por 2+ espaços (formato de `ufw status`).
+fn split_cols(s: &str) -> Vec<String> {
+    let mut cols = Vec::new();
+    let mut cur = String::new();
+    let mut spaces = 0;
+    for ch in s.chars() {
+        if ch == ' ' {
+            spaces += 1;
+            if spaces < 2 {
+                cur.push(' ');
+            }
+        } else {
+            if spaces >= 2 {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    cols.push(t.to_string());
+                }
+                cur.clear();
+            }
+            spaces = 0;
+            cur.push(ch);
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        cols.push(t.to_string());
+    }
+    cols
+}
+
+/// Some(true/false) se a regra (campo "To") cobre a porta/protocolo;
+/// None se não dá para decidir (perfil de aplicativo, IP de destino etc.).
+fn ufw_rule_matches(to: &str, proto: &str, port: u16) -> Option<bool> {
+    let first = to.split_whitespace().next().unwrap_or("");
+    if first.eq_ignore_ascii_case("anywhere") {
+        return Some(true);
+    }
+    let (ports_part, proto_part) = match first.split_once('/') {
+        Some((a, b)) => (a, Some(b)),
+        None => (first, None),
+    };
+    if let Some(pp) = proto_part {
+        if !pp.eq_ignore_ascii_case(proto) && !pp.eq_ignore_ascii_case("any") {
+            return Some(false);
+        }
+    }
+    let mut parsed_any = false;
+    for item in ports_part.split(',') {
+        if let Some((a, b)) = item.split_once(':') {
+            if let (Ok(a), Ok(b)) = (a.parse::<u16>(), b.parse::<u16>()) {
+                parsed_any = true;
+                if port >= a && port <= b {
+                    return Some(true);
+                }
+            }
+        } else if let Ok(n) = item.parse::<u16>() {
+            parsed_any = true;
+            if n == port {
+                return Some(true);
+            }
+        }
+    }
+    if parsed_any { Some(false) } else { None }
+}
+
+fn parse_ufw_status(out: &str) -> UfwStatus {
+    let mut st = UfwStatus::default();
+    let mut in_rules = false;
+    for raw in out.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("Status:") {
+            st.active = v.trim().eq_ignore_ascii_case("active");
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("Logging:") {
+            st.logging = v.trim().to_string();
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("Default:") {
+            for part in v.split(',') {
+                let toks: Vec<&str> = part.split_whitespace().collect();
+                if toks.len() >= 2 {
+                    let pol = toks[0].to_string();
+                    match toks[1].trim_matches(|c: char| c == '(' || c == ')') {
+                        "incoming" => st.default_in = pol,
+                        "outgoing" => st.default_out = pol,
+                        "routed" => st.default_routed = pol,
+                        _ => {}
+                    }
+                }
+            }
+            continue;
+        }
+        if line.starts_with("New profiles:") {
+            continue;
+        }
+        if line.starts_with("--") {
+            in_rules = true;
+            continue;
+        }
+        if !in_rules {
+            continue;
+        }
+        let body = if line.starts_with('[') {
+            line.split_once(']').map(|(_, r)| r.trim()).unwrap_or(line)
+        } else {
+            line
+        };
+        let cols = split_cols(body);
+        if cols.len() >= 3 {
+            let to = cols[0].clone();
+            let action = cols[1].clone();
+            let from = cols[2..].join(" ");
+            let v6 = to.contains("(v6)") || from.contains("(v6)");
+            st.rules.push(UfwRule::new(to, action, from, v6));
+        }
+    }
+    st
+}
+
+/// Cruza uma porta em escuta com as regras do UFW: (rótulo, cor, detalhe).
+fn fw_verdict(snap: &AuditSnapshot, p: &PortEntry) -> (String, Color32, String) {
+    if p.exposure == Exposure::Local {
+        return (
+            "—".to_string(),
+            MUTED,
+            "Bind somente local (loopback).".to_string(),
+        );
+    }
+    let Some(st) = &snap.ufw else {
+        return (
+            "não lido".to_string(),
+            MUTED,
+            "Abra a aba Firewall e use 'Ler regras (pkexec)'.".to_string(),
+        );
+    };
+    if !st.active {
+        return (
+            "UFW inativo".to_string(),
+            ORANGE,
+            "O UFW está inativo: nenhuma regra está sendo aplicada.".to_string(),
+        );
+    }
+    let Ok(port) = p.port.parse::<u16>() else {
+        return ("?".to_string(), MUTED, String::new());
+    };
+    let proto_owned = p.protocol.to_lowercase();
+    let proto = proto_owned.trim_end_matches('6');
+
+    let mut unresolved = false;
+    for r in &st.rules {
+        match ufw_rule_matches(&r.to, proto, port) {
+            Some(true) => {
+                let act = r.action.to_uppercase();
+                let detail = format!("{} · {} · {}", r.to, r.action, r.from);
+                return if act.starts_with("ALLOW") {
+                    if r.from.to_lowercase().starts_with("anywhere") {
+                        ("Liberada".to_string(), RED, detail)
+                    } else {
+                        ("Restrita".to_string(), ORANGE, detail)
+                    }
+                } else if act.starts_with("LIMIT") {
+                    ("Limitada".to_string(), ORANGE, detail)
+                } else {
+                    ("Bloqueada".to_string(), GREEN, detail)
+                };
+            }
+            Some(false) => {}
+            None => unresolved = true,
+        }
+    }
+    if unresolved {
+        return (
+            "Indeterminado".to_string(),
+            MUTED,
+            "Há regras por perfil de aplicativo/IP que não consegui resolver.".to_string(),
+        );
+    }
+    match st.default_in.to_lowercase().as_str() {
+        "deny" | "reject" => (
+            "Bloqueada (padrão)".to_string(),
+            GREEN,
+            format!(
+                "Sem regra específica; política padrão de entrada: {}.",
+                st.default_in
+            ),
+        ),
+        "allow" => (
+            "Aberta (padrão)".to_string(),
+            RED,
+            "Sem regra específica; política padrão de entrada: allow.".to_string(),
+        ),
+        _ => ("?".to_string(), MUTED, String::new()),
+    }
+}
+
+fn chip(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+    ui.label(RichText::new(label).color(MUTED));
+    ui.label(RichText::new(value).color(color).strong());
+    ui.add_space(12.0);
+}
 
 struct ArchCollectors;
 
@@ -1607,6 +1968,221 @@ impl ArchCollectors {
         }
     }
 
+    // ── Journal ──
+
+    /// Diferença local→UTC em segundos, via `date +%z` (sem depender de crates de fuso).
+    fn local_utc_offset_secs() -> i64 {
+        if let Ok(out) = Self::run_with_timeout("date", &["+%z"], 3) {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.len() == 5 && s.is_ascii() {
+                let sign = if s.starts_with('-') { -1 } else { 1 };
+                let hh = s[1..3].parse::<i64>().unwrap_or(0);
+                let mm = s[3..5].parse::<i64>().unwrap_or(0);
+                return sign * (hh * 3600 + mm * 60);
+            }
+        }
+        0
+    }
+
+    fn collect_journal(
+        prio: u8,
+        prev_boot: bool,
+        unit: &str,
+        kernel_only: bool,
+    ) -> (Vec<JournalEntry>, Option<String>) {
+        if !Self::command_exists("journalctl") {
+            return (Vec::new(), Some("journalctl não encontrado.".to_string()));
+        }
+
+        let mut args: Vec<String> = vec![
+            "-o".into(),
+            "json".into(),
+            "--no-pager".into(),
+            "-n".into(),
+            JOURNAL_LIMIT.to_string(),
+            "-p".into(),
+            prio.to_string(),
+            "-b".into(),
+        ];
+        if prev_boot {
+            args.push("-1".into());
+        }
+        if kernel_only {
+            args.push("-k".into());
+        }
+        let unit = unit.trim();
+        if !unit.is_empty() {
+            if !valid_unit_name(unit) {
+                return (Vec::new(), Some("Nome de unidade inválido.".to_string()));
+            }
+            args.push("-u".into());
+            args.push(unit.to_string());
+        }
+
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let output = match Self::run_with_timeout("journalctl", &arg_refs, 30) {
+            Ok(o) => o,
+            Err(e) => return (Vec::new(), Some(e)),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let offset = Self::local_utc_offset_secs();
+
+        let mut entries = Vec::new();
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let ts_us: i64 = v
+                .get("__REALTIME_TIMESTAMP")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let priority: u8 = v
+                .get("PRIORITY")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(6);
+            let unit_name = ["_SYSTEMD_UNIT", "SYSLOG_IDENTIFIER", "_COMM"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+                .unwrap_or("-")
+                .to_string();
+            let message = match v.get("MESSAGE") {
+                Some(serde_json::Value::String(s)) => s.replace(['\n', '\r'], " "),
+                Some(serde_json::Value::Array(a)) => {
+                    let bytes: Vec<u8> = a
+                        .iter()
+                        .filter_map(|n| n.as_u64().map(|n| n as u8))
+                        .collect();
+                    String::from_utf8_lossy(&bytes).replace(['\n', '\r'], " ")
+                }
+                _ => String::new(),
+            };
+            let time = fmt_datetime(ts_us / 1_000_000 + offset);
+            entries.push(JournalEntry::new(time, priority, unit_name, message));
+        }
+        entries.reverse(); // mais recentes primeiro
+
+        let note = if stderr.contains("not seeing messages") {
+            Some(
+                "Você não está vendo as mensagens do sistema. Adicione seu usuário ao grupo 'systemd-journal' (ou 'adm'/'wheel') e faça login de novo."
+                    .to_string(),
+            )
+        } else if entries.is_empty() && !output.status.success() {
+            Some(format!("journalctl falhou: {}", stderr.trim()))
+        } else {
+            None
+        };
+        (entries, note)
+    }
+
+    // ── Firewall (UFW) ──
+
+    fn parse_kv(content: &str, key: &str) -> Option<String> {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix(key) {
+                if let Some(v) = rest.trim_start().strip_prefix('=') {
+                    return Some(v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn map_policy(v: &str) -> String {
+        match v.to_uppercase().as_str() {
+            "DROP" => "deny".to_string(),
+            "REJECT" => "reject".to_string(),
+            "ACCEPT" => "allow".to_string(),
+            other => other.to_lowercase(),
+        }
+    }
+
+    /// Status do UFW sem privilégios: systemctl + /etc/ufw/ufw.conf + /etc/default/ufw.
+    fn collect_firewall_basic() -> FirewallBasic {
+        let installed = Self::command_exists("ufw");
+
+        let sysctl = |args: &[&str]| -> String {
+            if !Self::command_exists("systemctl") {
+                return "n/d".to_string();
+            }
+            match Self::run_with_timeout("systemctl", args, 5) {
+                Ok(o) => {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() { "n/d".to_string() } else { s }
+                }
+                Err(_) => "n/d".to_string(),
+            }
+        };
+        let service_active = sysctl(&["is-active", "ufw"]);
+        let service_enabled = sysctl(&["is-enabled", "ufw"]);
+
+        let conf = fs::read_to_string("/etc/ufw/ufw.conf").ok();
+        let conf_enabled = conf
+            .as_deref()
+            .and_then(|c| Self::parse_kv(c, "ENABLED"))
+            .map(|v| v.eq_ignore_ascii_case("yes"));
+        let log_level = conf.as_deref().and_then(|c| Self::parse_kv(c, "LOGLEVEL"));
+
+        let def = fs::read_to_string("/etc/default/ufw").ok();
+        let pol = |key: &str| {
+            def.as_deref()
+                .and_then(|c| Self::parse_kv(c, key))
+                .map(|v| Self::map_policy(&v))
+        };
+
+        FirewallBasic {
+            installed,
+            service_active,
+            service_enabled,
+            conf_enabled,
+            log_level,
+            default_in: pol("DEFAULT_INPUT_POLICY"),
+            default_out: pol("DEFAULT_OUTPUT_POLICY"),
+            default_routed: pol("DEFAULT_FORWARD_POLICY"),
+        }
+    }
+
+    /// Lê as regras via pkexec (polkit pede a senha). Só executa `ufw status verbose`.
+    fn read_ufw_rules_privileged() -> Result<UfwStatus, String> {
+        if !Self::command_exists("pkexec") {
+            return Err(
+                "pkexec (polkit) não encontrado. Instale 'polkit' ou rode no terminal: sudo ufw status verbose"
+                    .to_string(),
+            );
+        }
+        let output = Self::run_with_timeout(
+            "pkexec",
+            &["env", "LC_ALL=C", "ufw", "status", "verbose"],
+            90,
+        )?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(match output.status.code() {
+                Some(126) => "Autenticação cancelada ou negada.".to_string(),
+                Some(127) => "Falha na autenticação: nenhum agente polkit em execução?".to_string(),
+                _ => format!(
+                    "Falha ao executar 'ufw status verbose' ({}).",
+                    if err.is_empty() {
+                        "sem detalhes"
+                    } else {
+                        err.as_str()
+                    }
+                ),
+            });
+        }
+        Ok(parse_ufw_status(&String::from_utf8_lossy(&output.stdout)))
+    }
+
     // ── Executar / remover apps ──
 
     /// Inicia um processo desacoplado (não morre ao fechar o auditor).
@@ -1831,6 +2407,59 @@ impl ArchCollectors {
             }
         }
 
+        md.push_str("\n## 7. Firewall (UFW)\n\n");
+        md.push_str(&format!(
+            "- **Serviço:** {} (habilitado no boot: {})\n",
+            snap.firewall.service_active, snap.firewall.service_enabled
+        ));
+        match &snap.ufw {
+            Some(st) => {
+                md.push_str(&format!(
+                    "- **Status:** {} · Logging: {} · Padrão: {} (entrada), {} (saída)\n\n",
+                    if st.active { "ativo" } else { "inativo" },
+                    st.logging,
+                    st.default_in,
+                    st.default_out
+                ));
+                let exposed: Vec<&PortEntry> = snap
+                    .ports
+                    .iter()
+                    .filter(|p| p.exposure != Exposure::Local)
+                    .collect();
+                if !exposed.is_empty() {
+                    md.push_str("| Porta | Proto | Processo | Firewall |\n");
+                    md.push_str("| :--- | :--- | :--- | :--- |\n");
+                    for p in exposed {
+                        let (verdict, _, _) = fw_verdict(snap, p);
+                        md.push_str(&format!(
+                            "| `{}` | {} | {} | {} |\n",
+                            p.port,
+                            p.protocol,
+                            md_escape(&p.process),
+                            verdict
+                        ));
+                    }
+                }
+            }
+            None => {
+                md.push_str("- Regras não lidas (use 'Ler regras (pkexec)' na aba Firewall).\n")
+            }
+        }
+
+        if !snap.journal.is_empty() {
+            md.push_str("\n## 8. Journal (entradas mais recentes)\n\n");
+            for e in snap.journal.iter().take(15) {
+                let msg: String = e.message.chars().take(200).collect();
+                md.push_str(&format!(
+                    "- `{}` **{}** {} — {}\n",
+                    e.time,
+                    prio_name(e.priority),
+                    e.unit,
+                    msg
+                ));
+            }
+        }
+
         md
     }
 
@@ -1919,7 +2548,17 @@ struct ArchAuditorApp {
     loading_appimages: bool,
     loading_flatpaks: bool,
     loading_action: bool,
+    loading_journal: bool,
+    loading_firewall: bool,
+    loading_ufw: bool,
     full_running: bool,
+
+    journal_loaded: bool,
+    journal_prio: u8,
+    journal_boot_prev: bool,
+    journal_unit: String,
+    journal_kernel: bool,
+    fw_show_rules: bool,
 
     status: Option<Status>,
     confirm: Option<Confirm>,
@@ -1961,7 +2600,16 @@ impl ArchAuditorApp {
             loading_appimages: false,
             loading_flatpaks: false,
             loading_action: false,
+            loading_journal: false,
+            loading_firewall: false,
+            loading_ufw: false,
             full_running: false,
+            journal_loaded: false,
+            journal_prio: 4,
+            journal_boot_prev: false,
+            journal_unit: String::new(),
+            journal_kernel: false,
+            fw_show_rules: false,
             status: None,
             confirm: None,
             ports_sort: SortState::default(),
@@ -2037,10 +2685,12 @@ impl ArchAuditorApp {
             || self.loading_desktops
             || self.loading_appimages
             || self.loading_flatpaks
+            || self.loading_journal
+            || self.loading_firewall
     }
 
     fn any_busy(&self) -> bool {
-        self.any_data_loading() || self.loading_action
+        self.any_data_loading() || self.loading_action || self.loading_ufw
     }
 
     fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
@@ -2087,6 +2737,7 @@ impl ArchAuditorApp {
         self.start_desktops_refresh();
         self.start_appimages_refresh();
         self.start_flatpaks_refresh();
+        self.start_firewall_refresh();
         self.start_pkgs_refresh();
         self.start_cve_refresh(force_cve);
     }
@@ -2169,6 +2820,78 @@ impl ArchAuditorApp {
         thread::spawn(move || {
             let (flatpaks, note) = ArchCollectors::collect_flatpaks();
             em.send(WorkerEvent::Flatpaks { flatpaks, note });
+        });
+    }
+
+    fn start_journal_refresh(&mut self) {
+        if self.loading_journal {
+            return;
+        }
+        self.loading_journal = true;
+        self.note_start("Lendo o journal...");
+        let prio = self.journal_prio;
+        let prev = self.journal_boot_prev;
+        let unit = self.journal_unit.clone();
+        let kernel = self.journal_kernel;
+        let em = self.emitter.clone();
+        thread::spawn(move || {
+            let (entries, note) = ArchCollectors::collect_journal(prio, prev, &unit, kernel);
+            em.send(WorkerEvent::Journal { entries, note });
+        });
+    }
+
+    fn apply_journal_preset(&mut self, idx: usize) {
+        self.journal_unit.clear();
+        self.journal_kernel = false;
+        self.journal_boot_prev = false;
+        self.filter.clear();
+        match idx {
+            0 => self.journal_prio = 3,
+            1 => {
+                self.journal_prio = 6;
+                self.journal_unit = "sshd".to_string();
+                self.filter = "failed".to_string();
+            }
+            2 => {
+                self.journal_prio = 6;
+                self.filter = "sudo".to_string();
+            }
+            3 => {
+                self.journal_prio = 6;
+                self.journal_kernel = true;
+                self.filter = "ufw block".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    fn start_firewall_refresh(&mut self) {
+        if self.loading_firewall {
+            return;
+        }
+        self.loading_firewall = true;
+        let em = self.emitter.clone();
+        thread::spawn(move || {
+            em.send(WorkerEvent::FirewallBasic(
+                ArchCollectors::collect_firewall_basic(),
+            ));
+        });
+    }
+
+    fn start_ufw_read(&mut self) {
+        if self.loading_ufw {
+            return;
+        }
+        self.loading_ufw = true;
+        self.set_status(
+            "Aguardando autenticação (polkit) para ler as regras do UFW...",
+            false,
+        );
+        let em = self.emitter.clone();
+        thread::spawn(move || {
+            em.send(WorkerEvent::UfwRules(
+                ArchCollectors::read_ufw_rules_privileged(),
+            ));
         });
     }
 
@@ -2382,6 +3105,36 @@ impl ArchAuditorApp {
                 self.data.flatpak_note = note;
                 self.loading_flatpaks = false;
             }
+            WorkerEvent::Journal { entries, note } => {
+                let n = entries.len();
+                self.data.journal = entries;
+                self.data.journal_note = note;
+                self.loading_journal = false;
+                self.journal_loaded = true;
+                if !self.full_running {
+                    self.set_status(format!("Journal carregado ({} entrada(s)).", n), false);
+                }
+            }
+            WorkerEvent::FirewallBasic(info) => {
+                self.data.firewall = info;
+                self.loading_firewall = false;
+            }
+            WorkerEvent::UfwRules(res) => {
+                self.loading_ufw = false;
+                match res {
+                    Ok(st) => {
+                        let n = st.rules.len();
+                        self.data.ufw = Some(st);
+                        self.data.ufw_note = None;
+                        self.data.ufw_read_at = ArchCollectors::now_unix();
+                        self.set_status(format!("Regras do UFW lidas ({} regra(s)).", n), false);
+                    }
+                    Err(e) => {
+                        self.data.ufw_note = Some(e.clone());
+                        self.set_status(e, true);
+                    }
+                }
+            }
             WorkerEvent::ActionDone { message, is_error } => {
                 self.loading_action = false;
                 self.set_status(message, is_error);
@@ -2404,6 +3157,8 @@ impl ArchAuditorApp {
             Key::Num4,
             Key::Num5,
             Key::Num6,
+            Key::Num7,
+            Key::Num8,
         ];
         let (focus, upd, cves, export, all, esc, tab_idx) = ctx.input_mut(|i| {
             let tab_idx = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
@@ -2489,6 +3244,8 @@ impl ArchAuditorApp {
             ActiveTab::Desktops => self.loading_desktops,
             ActiveTab::AppImages => self.loading_appimages,
             ActiveTab::Flatpaks => self.loading_flatpaks,
+            ActiveTab::Journal => self.loading_journal,
+            ActiveTab::Firewall => self.loading_firewall || self.loading_ufw,
         }
     }
 
@@ -2528,6 +3285,33 @@ impl ArchAuditorApp {
             ActiveTab::Desktops => ("WMs / DEs", fmt(self.data.desktops.len()), BLUE),
             ActiveTab::AppImages => ("APPIMAGES", fmt(self.data.appimages.len()), PURPLE),
             ActiveTab::Flatpaks => ("FLATPAKS", fmt(self.data.flatpaks.len()), GREEN),
+            ActiveTab::Journal => {
+                let n = self.data.journal.len();
+                let value = if loading && n == 0 {
+                    "…".to_string()
+                } else if self.journal_loaded {
+                    n.to_string()
+                } else {
+                    "—".to_string()
+                };
+                ("JOURNAL", value, BLUE)
+            }
+            ActiveTab::Firewall => {
+                let (value, color) =
+                    match (&self.data.ufw, self.data.firewall.service_active.as_str()) {
+                        (Some(st), _) => {
+                            if st.active {
+                                ("ativo", GREEN)
+                            } else {
+                                ("inativo", ORANGE)
+                            }
+                        }
+                        (None, "active") => ("ativo", GREEN),
+                        (None, "inactive") | (None, "failed") => ("inativo", ORANGE),
+                        _ => (if loading { "…" } else { "—" }, MUTED),
+                    };
+                ("FIREWALL", value.to_string(), color)
+            }
         }
     }
 
@@ -2543,10 +3327,10 @@ impl ArchAuditorApp {
                 egui::Stroke::new(1.0, BORDER)
             })
             .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(12, 6));
+            .inner_margin(egui::Margin::symmetric(8, 5));
 
         let resp = frame.show(ui, |ui| {
-            ui.set_min_width(92.0);
+            ui.set_min_width(66.0);
             ui.vertical(|ui| {
                 ui.label(RichText::new(title).size(11.0).color(MUTED));
                 ui.label(RichText::new(value).size(15.0).strong().color(accent));
@@ -2651,6 +3435,7 @@ impl ArchAuditorApp {
                 .column(Column::auto().at_least(60.0))
                 .column(Column::auto().at_least(140.0))
                 .column(Column::auto().at_least(60.0))
+                .column(Column::auto().at_least(80.0))
                 .column(Column::remainder())
                 .header(26.0, |mut header| {
                     for (i, t) in [
@@ -2667,10 +3452,14 @@ impl ArchAuditorApp {
                     {
                         header.col(|ui| sort_header(ui, t, i, sort));
                     }
+                    header.col(|ui| {
+                        ui.strong("Firewall (UFW)");
+                    });
                 })
                 .body(|body| {
                     body.rows(24.0, rows.len(), |mut row| {
                         let p = rows[row.index()];
+                        let (fw_txt, fw_color, fw_detail) = fw_verdict(&self.data, p);
                         let (badge_txt, badge_color, addr_color) = match p.exposure {
                             Exposure::External => ("⚠ EXTERNA (0.0.0.0/[::])", RED, AMBER),
                             Exposure::Local => ("● LOCAL", GREEN, MUTED),
@@ -2701,6 +3490,10 @@ impl ArchAuditorApp {
                         });
                         row.col(|ui| {
                             ui.label(&p.state);
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(&fw_txt).color(fw_color).strong())
+                                .on_hover_text(&fw_detail);
                         });
                         row.response().context_menu(|ui| {
                             if ui.button("Copiar porta").clicked() {
@@ -3491,6 +4284,495 @@ impl ArchAuditorApp {
         }
     }
 
+    // ── Aba: Journal ──
+
+    fn render_journal_tab(&mut self, ui: &mut egui::Ui) {
+        let q = self.filter.trim().to_lowercase();
+        let mut reload = false;
+        let mut preset: Option<usize> = None;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Prioridade:");
+            egui::ComboBox::from_id_salt("journal_prio")
+                .selected_text(prio_label(self.journal_prio))
+                .show_ui(ui, |ui| {
+                    for p in [3u8, 4, 5, 6] {
+                        if ui
+                            .selectable_value(&mut self.journal_prio, p, prio_label(p))
+                            .changed()
+                        {
+                            reload = true;
+                        }
+                    }
+                });
+            egui::ComboBox::from_id_salt("journal_boot")
+                .selected_text(if self.journal_boot_prev {
+                    "Boot anterior"
+                } else {
+                    "Boot atual"
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(&mut self.journal_boot_prev, false, "Boot atual")
+                        .changed()
+                    {
+                        reload = true;
+                    }
+                    if ui
+                        .selectable_value(&mut self.journal_boot_prev, true, "Boot anterior")
+                        .changed()
+                    {
+                        reload = true;
+                    }
+                });
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.journal_unit)
+                    .hint_text("Unidade (ex.: sshd)")
+                    .desired_width(160.0),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                reload = true;
+            }
+            if ui
+                .checkbox(&mut self.journal_kernel, "Somente kernel")
+                .changed()
+            {
+                reload = true;
+            }
+            if ui
+                .add_enabled(!self.loading_journal, egui::Button::new("Carregar"))
+                .clicked()
+            {
+                reload = true;
+            }
+            if self.loading_journal {
+                ui.spinner();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Atalhos:").color(MUTED));
+            for (i, name) in [
+                "Erros do sistema",
+                "Falhas de login (sshd)",
+                "Uso de sudo",
+                "Bloqueios do UFW",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if ui.small_button(*name).clicked() {
+                    preset = Some(i);
+                }
+            }
+        });
+
+        if let Some(i) = preset {
+            self.apply_journal_preset(i);
+            reload = true;
+        }
+        if reload {
+            self.start_journal_refresh();
+        }
+
+        if let Some(note) = &self.data.journal_note {
+            ui.colored_label(ORANGE, format!("⚠ {}", note));
+        }
+
+        let rows: Vec<&JournalEntry> = self
+            .data
+            .journal
+            .iter()
+            .filter(|e| q.is_empty() || e.search.contains(&q))
+            .collect();
+
+        count_label(ui, rows.len(), self.data.journal.len());
+        ui.add_space(4.0);
+
+        if self.data.journal.is_empty() {
+            empty_state(
+                ui,
+                if self.loading_journal || !self.journal_loaded {
+                    "Lendo o journal..."
+                } else {
+                    "Nenhuma entrada para os filtros atuais."
+                },
+            );
+            return;
+        }
+        if rows.is_empty() {
+            empty_state(ui, "Nenhum resultado para o filtro atual.");
+            return;
+        }
+
+        ui.push_id("journal_table", |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(150.0))
+                .column(Column::auto().at_least(70.0))
+                .column(Column::auto().at_least(170.0).clip(true))
+                .column(Column::remainder().clip(true))
+                .header(26.0, |mut header| {
+                    for t in ["Hora", "Prio", "Unidade", "Mensagem"] {
+                        header.col(|ui| {
+                            ui.strong(t);
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(22.0, rows.len(), |mut row| {
+                        let e = rows[row.index()];
+                        let color = prio_color(e.priority);
+                        row.col(|ui| {
+                            ui.label(RichText::new(&e.time).monospace().color(MUTED));
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(prio_name(e.priority)).color(color).strong());
+                        });
+                        row.col(|ui| {
+                            ui.add(egui::Label::new(RichText::new(&e.unit).strong()).truncate());
+                        });
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(&e.message).monospace()).truncate(),
+                            )
+                            .on_hover_text(&e.message);
+                        });
+                        row.response().context_menu(|ui| {
+                            if ui.button("Copiar mensagem").clicked() {
+                                ui.ctx().copy_text(e.message.clone());
+                                ui.close();
+                            }
+                            if ui.button("Copiar linha completa").clicked() {
+                                ui.ctx().copy_text(format!(
+                                    "{} {} {}: {}",
+                                    e.time,
+                                    prio_name(e.priority),
+                                    e.unit,
+                                    e.message
+                                ));
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+        });
+    }
+
+    // ── Aba: Firewall (UFW) ──
+
+    fn render_firewall_tab(&mut self, ui: &mut egui::Ui) {
+        let q = self.filter.trim().to_lowercase();
+        let fw = self.data.firewall.clone();
+        let mut do_refresh = false;
+        let mut do_read = false;
+
+        card_frame().show(ui, |ui| {
+            ui.strong("Firewall — UFW");
+            ui.add_space(4.0);
+
+            if !fw.installed && !self.loading_firewall {
+                ui.colored_label(ORANGE, "UFW não encontrado. Instale com: sudo pacman -S ufw");
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    let svc = fw.service_active.as_str();
+                    let svc_color = match svc {
+                        "active" => GREEN,
+                        "failed" => RED,
+                        "inactive" => ORANGE,
+                        _ => MUTED,
+                    };
+                    chip(ui, "Serviço", svc, svc_color);
+                    chip(
+                        ui,
+                        "No boot",
+                        &fw.service_enabled,
+                        if fw.service_enabled == "enabled" {
+                            GREEN
+                        } else {
+                            ORANGE
+                        },
+                    );
+                    if let Some(en) = fw.conf_enabled {
+                        chip(
+                            ui,
+                            "ufw.conf",
+                            if en { "ENABLED=yes" } else { "ENABLED=no" },
+                            if en { GREEN } else { ORANGE },
+                        );
+                    }
+                    let (din, dout, drt) = match &self.data.ufw {
+                        Some(st) => (
+                            st.default_in.clone(),
+                            st.default_out.clone(),
+                            st.default_routed.clone(),
+                        ),
+                        None => (
+                            fw.default_in.clone().unwrap_or_else(|| "?".to_string()),
+                            fw.default_out.clone().unwrap_or_else(|| "?".to_string()),
+                            fw.default_routed.clone().unwrap_or_else(|| "?".to_string()),
+                        ),
+                    };
+                    chip(
+                        ui,
+                        "Padrão",
+                        &format!("entrada {} · saída {} · roteada {}", din, dout, drt),
+                        BLUE,
+                    );
+                    if let Some(st) = &self.data.ufw {
+                        chip(
+                            ui,
+                            "Status",
+                            if st.active { "ativo" } else { "inativo" },
+                            if st.active { GREEN } else { ORANGE },
+                        );
+                        chip(ui, "Logging", &st.logging, MUTED);
+                    } else if let Some(l) = &fw.log_level {
+                        chip(ui, "Log", l, MUTED);
+                    }
+                });
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.loading_firewall, egui::Button::new("Atualizar status"))
+                    .clicked()
+                {
+                    do_refresh = true;
+                }
+                if ui
+                    .add_enabled(
+                        fw.installed && !self.loading_ufw,
+                        egui::Button::new("Ler regras (pkexec)"),
+                    )
+                    .on_hover_text(
+                        "Executa somente 'ufw status verbose' como root via pkexec (o polkit pede sua senha).",
+                    )
+                    .clicked()
+                {
+                    do_read = true;
+                }
+                if self.loading_firewall || self.loading_ufw {
+                    ui.spinner();
+                }
+                if self.data.ufw_read_at > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "Regras lidas {}",
+                            fmt_ago(
+                                ArchCollectors::now_unix().saturating_sub(self.data.ufw_read_at)
+                            )
+                        ))
+                        .color(MUTED)
+                        .small(),
+                    );
+                }
+            });
+        });
+
+        if do_refresh {
+            self.start_firewall_refresh();
+        }
+        if do_read {
+            self.start_ufw_read();
+        }
+
+        if let Some(n) = &self.data.ufw_note {
+            ui.colored_label(RED, format!("⚠ {}", n));
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.fw_show_rules, false, "Portas × firewall");
+            ui.selectable_value(&mut self.fw_show_rules, true, "Regras do UFW");
+        });
+        ui.add_space(4.0);
+
+        if !self.fw_show_rules {
+            // ── Portas externas × regras ──
+            let rows: Vec<&PortEntry> = self
+                .data
+                .ports
+                .iter()
+                .filter(|p| p.exposure != Exposure::Local)
+                .filter(|p| q.is_empty() || p.search.contains(&q))
+                .collect();
+
+            count_label(ui, rows.len(), self.data.ports.len());
+            ui.add_space(4.0);
+
+            if rows.is_empty() {
+                empty_state(ui, "Nenhuma porta externa em escuta.");
+            } else {
+                let verdicts: Vec<(String, Color32, String)> =
+                    rows.iter().map(|p| fw_verdict(&self.data, p)).collect();
+
+                ui.push_id("fw_ports_table", |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .sense(egui::Sense::click())
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto().at_least(70.0))
+                        .column(Column::auto().at_least(60.0))
+                        .column(Column::auto().at_least(130.0))
+                        .column(Column::auto().at_least(160.0))
+                        .column(Column::auto().at_least(150.0))
+                        .column(Column::remainder().clip(true))
+                        .header(26.0, |mut header| {
+                            for t in [
+                                "Porta",
+                                "Proto",
+                                "Endereço",
+                                "Processo",
+                                "Firewall",
+                                "Regra aplicada",
+                            ] {
+                                header.col(|ui| {
+                                    ui.strong(t);
+                                });
+                            }
+                        })
+                        .body(|body| {
+                            body.rows(24.0, rows.len(), |mut row| {
+                                let i = row.index();
+                                let p = rows[i];
+                                let (txt, color, detail) = &verdicts[i];
+                                row.col(|ui| {
+                                    ui.label(
+                                        RichText::new(&p.port).strong().monospace().color(*color),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.label(&p.protocol);
+                                });
+                                row.col(|ui| {
+                                    ui.label(RichText::new(&p.local_addr).monospace());
+                                });
+                                row.col(|ui| {
+                                    ui.label(RichText::new(&p.process).strong());
+                                });
+                                row.col(|ui| {
+                                    ui.label(RichText::new(txt).color(*color).strong());
+                                });
+                                row.col(|ui| {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(detail).color(MUTED))
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(detail);
+                                });
+                                row.response().context_menu(|ui| {
+                                    let proto_lc = p.protocol.to_lowercase();
+                                    let proto = proto_lc.trim_end_matches('6');
+                                    let allow = format!("sudo ufw allow {}/{}", p.port, proto);
+                                    let deny = format!("sudo ufw deny {}/{}", p.port, proto);
+                                    if ui.button(format!("Copiar: {}", allow)).clicked() {
+                                        ui.ctx().copy_text(allow.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("Copiar: {}", deny)).clicked() {
+                                        ui.ctx().copy_text(deny.clone());
+                                        ui.close();
+                                    }
+                                });
+                            });
+                        });
+                });
+            }
+        } else {
+            // ── Regras do UFW ──
+            match &self.data.ufw {
+                None => empty_state(
+                    ui,
+                    "Regras ainda não lidas. Clique em 'Ler regras (pkexec)'.",
+                ),
+                Some(st) => {
+                    let rows: Vec<&UfwRule> = st
+                        .rules
+                        .iter()
+                        .filter(|r| q.is_empty() || r.search.contains(&q))
+                        .collect();
+
+                    count_label(ui, rows.len(), st.rules.len());
+                    ui.add_space(4.0);
+
+                    if st.rules.is_empty() {
+                        empty_state(
+                            ui,
+                            if st.active {
+                                "O UFW está ativo, mas não há regras cadastradas."
+                            } else {
+                                "O UFW está inativo (sem regras listadas)."
+                            },
+                        );
+                    } else if rows.is_empty() {
+                        empty_state(ui, "Nenhum resultado para o filtro atual.");
+                    } else {
+                        ui.push_id("ufw_rules_table", |ui| {
+                            TableBuilder::new(ui)
+                                .striped(true)
+                                .resizable(true)
+                                .sense(egui::Sense::click())
+                                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                                .column(Column::auto().at_least(220.0))
+                                .column(Column::auto().at_least(120.0))
+                                .column(Column::auto().at_least(220.0))
+                                .column(Column::remainder())
+                                .header(26.0, |mut header| {
+                                    for t in ["Para", "Ação", "Origem", "IPv6"] {
+                                        header.col(|ui| {
+                                            ui.strong(t);
+                                        });
+                                    }
+                                })
+                                .body(|body| {
+                                    body.rows(24.0, rows.len(), |mut row| {
+                                        let r = rows[row.index()];
+                                        let act = r.action.to_uppercase();
+                                        let act_color = if act.starts_with("ALLOW") {
+                                            GREEN
+                                        } else if act.starts_with("LIMIT") {
+                                            ORANGE
+                                        } else {
+                                            RED
+                                        };
+                                        row.col(|ui| {
+                                            ui.label(RichText::new(&r.to).strong().monospace());
+                                        });
+                                        row.col(|ui| {
+                                            ui.label(
+                                                RichText::new(&r.action).color(act_color).strong(),
+                                            );
+                                        });
+                                        row.col(|ui| {
+                                            ui.label(RichText::new(&r.from).monospace());
+                                        });
+                                        row.col(|ui| {
+                                            ui.label(if r.v6 { "sim" } else { "não" });
+                                        });
+                                        row.response().context_menu(|ui| {
+                                            if ui.button("Copiar regra").clicked() {
+                                                ui.ctx().copy_text(format!(
+                                                    "{}  {}  {}",
+                                                    r.to, r.action, r.from
+                                                ));
+                                                ui.close();
+                                            }
+                                        });
+                                    });
+                                });
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // ── Diálogo de confirmação ──
 
     fn render_confirm(&mut self, ctx: &egui::Context) {
@@ -3597,6 +4879,9 @@ impl eframe::App for ArchAuditorApp {
         self.handle_shortcuts(&ctx, filter_id);
         self.maybe_auto_refresh_ports(&ctx);
         self.expire_status(&ctx);
+        if self.active_tab == ActiveTab::Journal && !self.journal_loaded && !self.loading_journal {
+            self.start_journal_refresh();
+        }
 
         let any_busy = self.any_busy();
 
@@ -3710,7 +4995,7 @@ impl eframe::App for ArchAuditorApp {
                     None => {
                         ui.label(
                             RichText::new(
-                                "Ctrl+F buscar · Ctrl+1…6 abas · F5 atualizar tudo · Ctrl+U pacotes · Ctrl+Shift+C CVEs · Ctrl+E exportar",
+                                "Ctrl+F buscar · Ctrl+1…8 abas · F5 atualizar tudo · Ctrl+U pacotes · Ctrl+Shift+C CVEs · Ctrl+E exportar",
                             )
                             .color(MUTED),
                         );
@@ -3729,6 +5014,8 @@ impl eframe::App for ArchAuditorApp {
             ActiveTab::Desktops => self.render_desktops_tab(ui),
             ActiveTab::AppImages => self.render_appimages_tab(ui),
             ActiveTab::Flatpaks => self.render_flatpaks_tab(ui),
+            ActiveTab::Journal => self.render_journal_tab(ui),
+            ActiveTab::Firewall => self.render_firewall_tab(ui),
         });
 
         self.render_confirm(&ctx);
@@ -3751,9 +5038,9 @@ impl eframe::App for ArchAuditorApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 760.0])
-            .with_min_inner_size([980.0, 520.0])
-            .with_title("Arch Linux Visual System Auditor"),
+            .with_inner_size([1360.0, 780.0])
+            .with_min_inner_size([1120.0, 540.0])
+            .with_title("Arch Linux Visual System Auditor (eframe)"),
         ..Default::default()
     };
 
@@ -3833,5 +5120,41 @@ mod tests {
             ArchCollectors::decode_ipv6("00000000000000000000000000000000"),
             "[::]"
         );
+    }
+
+    #[test]
+    fn split_cols_ufw_lines() {
+        let c = split_cols("22/tcp (v6)                ALLOW IN    Anywhere (v6)");
+        assert_eq!(c, vec!["22/tcp (v6)", "ALLOW IN", "Anywhere (v6)"]);
+    }
+
+    #[test]
+    fn ufw_rule_matching() {
+        assert_eq!(ufw_rule_matches("80,443/tcp", "tcp", 443), Some(true));
+        assert_eq!(ufw_rule_matches("22/tcp", "udp", 22), Some(false));
+        assert_eq!(ufw_rule_matches("6000:6010/tcp", "tcp", 6005), Some(true));
+        assert_eq!(ufw_rule_matches("Anywhere", "tcp", 1), Some(true));
+        assert_eq!(ufw_rule_matches("OpenSSH", "tcp", 22), None);
+    }
+
+    #[test]
+    fn parse_ufw_status_sample() {
+        let sample = "Status: active\nLogging: on (low)\nDefault: deny (incoming), allow (outgoing), disabled (routed)\nNew profiles: skip\n\nTo                         Action      From\n--                         ------      ----\n22/tcp                     ALLOW IN    Anywhere\n80,443/tcp                 ALLOW IN    192.168.1.0/24\n22/tcp (v6)                ALLOW IN    Anywhere (v6)\n";
+        let st = parse_ufw_status(sample);
+        assert!(st.active);
+        assert_eq!(st.default_in, "deny");
+        assert_eq!(st.default_out, "allow");
+        assert_eq!(st.rules.len(), 3);
+        assert_eq!(st.rules[0].to, "22/tcp");
+        assert_eq!(st.rules[0].action, "ALLOW IN");
+        assert_eq!(st.rules[1].from, "192.168.1.0/24");
+        assert!(st.rules[2].v6);
+    }
+
+    #[test]
+    fn datetime_format() {
+        assert_eq!(fmt_datetime(0), "1970-01-01 00:00:00");
+        assert_eq!(fmt_datetime(86_400 * 365), "1971-01-01 00:00:00");
+        assert_eq!(fmt_datetime(951_782_400), "2000-02-29 00:00:00");
     }
 }
